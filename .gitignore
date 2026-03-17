@@ -205,3 +205,55 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+# Environment & Secrets
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Conda
+condaenv.yml
+
+# Models & Cache (Huge files — never commit)
+*.bin
+*.safetensors
+*.pt
+*.pth
+huggingface/
+.hf_cache/
+cache/
+models/
+data/
+*.h5
+
+# Large datasets
+*.parquet
+*.arrow
+*.csv.gz
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Gradio temporary
+.gradio/
