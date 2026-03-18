@@ -68,6 +68,30 @@ If model is already downloaded, force local cache use:
 C:/Users/rohan/miniconda3/envs/veridiction/python.exe agents/langgraph_flow.py --live-mic --audio-model-dir data/models/faster-whisper --audio-local-files-only --record-out data/audio_live.wav --audio-max-seconds 30 --audio-silence-seconds 2.0 --audio-language en --top-k 5
 ```
 
+## Step 6: Gradio UI (End-to-End System Interface)
+
+Launch UI:
+
+```powershell
+C:/Users/rohan/miniconda3/envs/veridiction/python.exe app_gradio.py
+```
+
+Open in browser:
+
+```text
+http://127.0.0.1:7860
+```
+
+Quick test flow in UI:
+1. Provide microphone input (or text input).
+2. Click `Run End-to-End`.
+3. Verify outputs:
+	- transcript/final query
+	- claim type, urgency, confidence
+	- retrieved passages
+	- advisor final response
+	- TTS audio player output
+
 Expected output now includes:
 - `input_mode` (`audio` or `text`)
 - `transcript` (when audio mode is used)

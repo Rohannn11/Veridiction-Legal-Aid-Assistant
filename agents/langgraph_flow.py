@@ -306,6 +306,10 @@ def _build_cli() -> argparse.ArgumentParser:
     parser.add_argument("--audio-language", type=str, default="en")
     parser.add_argument("--audio-beam-size", type=int, default=5)
     parser.add_argument("--audio-no-vad", action="store_true")
+    parser.add_argument("--enable-tts", action="store_true", help="Generate Step 5 TTS audio output")
+    parser.add_argument("--tts-output", type=str, default="data/tts/final_response.mp3")
+    parser.add_argument("--tts-engine", type=str, default="edge_tts", choices=["edge_tts", "pyttsx3"])
+    parser.add_argument("--tts-fallback-engine", type=str, default="pyttsx3", choices=["pyttsx3", "edge_tts"])
     parser.add_argument("--top-k", type=int, default=5)
     return parser
 
@@ -382,6 +386,29 @@ def main() -> None:
 
     flow = VeridictionGraph(top_k=args.top_k)
     output = flow.run(query_text)
+
+    if args.enable_tts:
+        from tts.speak import TTSConfig, TTSGenerator
+
+        tts_generator = TTSGenerator(
+            config=TTSConfig(
+                preferred_engine=args.tts_engine,
+                fallback_engine=args.tts_fallback_engine,
+                output_dir="data/tts",
+            )
+        )
+        tts_result = tts_generator.speak_to_file(
+            text=output.get("final_text", ""),
+            output_path=args.tts_output,
+            include_disclaimer=False,
+        )
+        output["tts"] = {
+            "engine": tts_result["engine"],
+            "audio_path": tts_result["audio_path"],
+            "mime_type": tts_result["mime_type"],
+            "size_bytes": tts_result["size_bytes"],
+        }
+
     if audio_metadata is not None:
         output["input_mode"] = "audio"
         output["transcript"] = query_text
