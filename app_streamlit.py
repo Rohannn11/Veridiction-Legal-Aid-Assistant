@@ -91,8 +91,18 @@ def _format_passages_for_table(passages: List[Dict[str, Any]]) -> List[Dict[str,
         score = float(item.get("score") or 0.0)
         text = str(item.get("passage", "")).strip().replace("\n", " ")
         preview = text[:260].rstrip() + (" ..." if len(text) > 260 else "")
-        source = str(item.get("metadata", {}).get("dataset", ""))
-        rows.append({"Rank": idx, "Score": round(score, 4), "Source": source, "Passage Preview": preview})
+        metadata = item.get("metadata", {}) or {}
+        source = str(metadata.get("dataset", ""))
+        source_label = str(metadata.get("source_label", "")) or "Judgment Index"
+        rows.append(
+            {
+                "Rank": idx,
+                "Score": round(score, 4),
+                "Index": source_label,
+                "Source": source,
+                "Passage Preview": preview,
+            }
+        )
     return rows
 
 
@@ -834,6 +844,8 @@ def run_pipeline(
     ) = _extract_structured_sections(structured_response)
     safety = output.get("safety", {}) or {}
     flow_explanation_lines = _build_flow_explanation_lines(flowchart_graph_data)
+    severity_level = str((structured_response.get("severity_assessment", {}) or {}).get("level", ""))
+    risk_flags = list(safety.get("risk_flags", []) or [])
 
     status = (
         "Run completed successfully. "
@@ -860,6 +872,8 @@ def run_pipeline(
         "flowchart_explanation_lines": flow_explanation_lines,
         "tts_summary_text": tts_summary_text,
         "safety_data": safety,
+        "severity_level": severity_level,
+        "risk_flags": risk_flags,
         "safety_json": json.dumps(safety, ensure_ascii=True, indent=2),
         "passage_table": passage_table,
         "structured_json": json.dumps(structured, ensure_ascii=True, indent=2),
@@ -884,30 +898,390 @@ def _render_status_panel(result: Dict[str, Any]) -> None:
     st.write(result.get("status", ""))
 
 
+def _inject_theme() -> None:
+    st.markdown(
+        """
+<style>
+:root {
+  --va-bg: #f7f8fa;
+  --va-surface: #ffffff;
+  --va-text: #111827;
+  --va-muted: #374151;
+  --va-border: #d1d5db;
+  --va-brand: #0f766e;
+  --va-brand-2: #14532d;
+}
+.stApp {
+  background: linear-gradient(180deg, #f9fafb 0%, #f4f7fb 100%);
+  color: var(--va-text);
+}
+.va-hero {
+  border: 1px solid var(--va-border);
+  background: var(--va-surface);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+}
+.va-hero-title {
+  font-size: 17px;
+  font-weight: 700;
+  color: var(--va-text);
+  margin-bottom: 8px;
+}
+.va-hero-sub {
+  color: var(--va-muted);
+  line-height: 1.4;
+}
+.va-badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0 10px;
+}
+.va-badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+.va-badge-neutral { background: #e5e7eb; color: #111827; border-color: #9ca3af; }
+.va-badge-low { background: #dcfce7; color: #14532d; border-color: #16a34a; }
+.va-badge-medium { background: #fef3c7; color: #92400e; border-color: #d97706; }
+.va-badge-high { background: #fee2e2; color: #7f1d1d; border-color: #dc2626; }
+.va-panel {
+    border: 1px solid #d1d5db;
+    border-radius: 12px;
+    background: #ffffff;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+    box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+.va-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.va-panel-icon {
+    width: 26px;
+    height: 26px;
+    border-radius: 999px;
+    border: 1px solid #94a3b8;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    color: #1e293b;
+    background: #eff6ff;
+}
+.va-panel-title {
+    font-weight: 700;
+    color: #0f172a;
+    font-size: 15px;
+}
+.va-panel-body {
+    color: #334155;
+    line-height: 1.45;
+}
+.va-subsection {
+    border: 1px solid #dbe4ef;
+    border-radius: 10px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: #f8fbff;
+}
+.va-sub-title {
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+    margin-bottom: 6px;
+}
+.va-sub-title.summary { color: #0f766e; }
+.va-sub-title.legal { color: #0b4a8b; }
+.va-sub-title.immediate { color: #8a1c1c; }
+.va-sub-title.evidence { color: #92400e; }
+.va-sub-title.courts { color: #1d4ed8; }
+.va-sub-title.helpline { color: #166534; }
+.va-item-list {
+    margin: 0;
+    padding-left: 18px;
+    color: #1f2937;
+}
+.va-item-list li {
+    margin: 3px 0;
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _badge_class(level: str) -> str:
+    value = (level or "").strip().lower()
+    if value in {"critical", "high"}:
+        return "va-badge-high"
+    if value == "medium":
+        return "va-badge-medium"
+    if value == "low":
+        return "va-badge-low"
+    return "va-badge-neutral"
+
+
+def _render_hero_summary(result: Dict[str, Any]) -> None:
+    severity = str(result.get("severity_level", "")).strip() or "not set"
+    urgency = str(result.get("urgency", "")).strip() or "not set"
+    claim = str(result.get("claim_type", "")).replace("_", " ").title() or "Unclassified"
+    risk_flags = list(result.get("risk_flags", []) or [])
+    risk_count = len(risk_flags)
+    headline = str(result.get("tts_summary_text", "")).strip() or str(result.get("final_text", "")).strip()
+    if len(headline) > 320:
+        headline = headline[:317].rstrip() + "..."
+
+    st.markdown(
+        (
+            "<div class='va-hero'>"
+            "<div class='va-hero-title'>Case Snapshot</div>"
+            f"<div class='va-badge-row'>"
+            f"<span class='va-badge va-badge-neutral'>Claim: {escape(claim)}</span>"
+            f"<span class='va-badge {_badge_class(severity)}'>Severity: {escape(severity.title())}</span>"
+            f"<span class='va-badge {_badge_class(urgency)}'>Urgency: {escape(urgency.title())}</span>"
+            f"<span class='va-badge {'va-badge-high' if risk_count else 'va-badge-low'}'>Risk Flags: {risk_count}</span>"
+            "</div>"
+            f"<div class='va-hero-sub'>{escape(headline)}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_quick_actions(result: Dict[str, Any]) -> None:
+    st.subheader("Quick Actions")
+    steps_text = str(result.get("possible_steps_text", "")).strip()
+    flow_lines = list(result.get("flowchart_explanation_lines", []) or [])
+    if flow_lines:
+        steps_text = (steps_text + "\n\nFlow Explanation:\n" + "\n".join(flow_lines)).strip()
+
+    c1, c2, c3 = st.columns(3)
+    c1.download_button(
+        "Download Steps (.txt)",
+        data=steps_text or "No steps available",
+        file_name="legal_steps.txt",
+        mime="text/plain",
+        use_container_width=True,
+    )
+    c2.download_button(
+        "Download JSON",
+        data=str(result.get("structured_json", "{}")),
+        file_name="legal_response.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    tts_path = result.get("tts_path")
+    audio_bytes = b""
+    if tts_path:
+        try:
+            audio_bytes = Path(str(tts_path)).read_bytes()
+        except OSError:
+            audio_bytes = b""
+    c3.download_button(
+        "Download Audio",
+        data=audio_bytes,
+        file_name="legal_summary.mp3",
+        mime="audio/mpeg",
+        disabled=not bool(audio_bytes),
+        use_container_width=True,
+    )
+
+    if st.button("Copy Steps Text (shows copy box)", key="copy_steps_btn"):
+        st.session_state["steps_copy_payload"] = steps_text or "No steps available"
+
+    payload = str(st.session_state.get("steps_copy_payload", "")).strip()
+    if payload:
+        st.code(payload, language="text")
+
+
+def _render_pinned_audio_sidebar() -> None:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Pinned Audio")
+    latest = st.session_state.get("latest_result")
+    if not latest:
+        st.sidebar.caption("Run a query to pin the latest audio summary here.")
+        return
+
+    tts_path = latest.get("tts_path")
+    if not tts_path:
+        st.sidebar.caption("No TTS output available for the latest result.")
+        return
+
+    try:
+        audio_bytes = Path(str(tts_path)).read_bytes()
+    except OSError:
+        st.sidebar.caption("Pinned audio file is unavailable on disk.")
+        return
+
+    st.sidebar.audio(audio_bytes, format="audio/mpeg")
+    st.sidebar.download_button(
+        "Download pinned audio",
+        data=audio_bytes,
+        file_name="pinned_legal_summary.mp3",
+        mime="audio/mpeg",
+        use_container_width=True,
+    )
+
+
+def _section_items_from_text(section_text: str) -> List[str]:
+    lines = [ln.strip() for ln in str(section_text or "").splitlines() if ln.strip()]
+    cleaned: List[str] = []
+    for line in lines:
+        item = line
+        if item.endswith(":") and len(item.split()) <= 4:
+            continue
+        if item.startswith("- "):
+            item = item[2:].strip()
+        if item.startswith("* "):
+            item = item[2:].strip()
+        cleaned.append(item)
+    return cleaned
+
+
+def _group_section_items(title: str, items: List[str]) -> List[Tuple[str, List[str], str]]:
+    groups: Dict[str, List[str]] = {}
+
+    def _add(group_title: str, value: str, style: str) -> None:
+        key = f"{group_title}||{style}"
+        groups.setdefault(key, []).append(value)
+
+    for item in items:
+        match = re.match(r"^([A-Za-z][A-Za-z /&-]{1,28}):\s*(.+)$", item)
+        if match:
+            prefix = match.group(1).strip().lower()
+            value = match.group(2).strip()
+            if prefix in {"immediate", "next 48 hours"}:
+                _add("Immediate Actions", value, "immediate")
+                continue
+            if prefix in {"legal", "process", "jurisdiction", "forum", "state"}:
+                _add("Legal Process", value, "legal")
+                continue
+            if prefix in {"mandatory", "supporting", "optional"}:
+                _add("Documentation", f"{match.group(1).strip()}: {value}", "evidence")
+                continue
+            if prefix in {"level", "rationale", "time sensitivity"}:
+                _add("Risk and Severity", f"{match.group(1).strip()}: {value}", "summary")
+                continue
+            if prefix in {"key facts", "missing details"}:
+                _add("Scenario Details", f"{match.group(1).strip()}: {value}", "summary")
+                continue
+        lowered = item.lower()
+        if any(token in lowered for token in ("helpline", "availability", "applicability", "1091", "181", "112")):
+            _add("Helplines", item, "helpline")
+        elif "court" in lowered or "forum" in lowered or "jurisdiction" in lowered:
+            _add("Courts and Forums", item, "courts")
+        elif any(token in lowered for token in ("document", "proof", "evidence", "record", "contract", "slip")):
+            _add("Documentation", item, "evidence")
+        else:
+            section = "Section Summary" if "scenario" in title.lower() else "Key Points"
+            _add(section, item, "summary")
+
+    ordered: List[Tuple[str, List[str], str]] = []
+    for key, values in groups.items():
+        group_title, style = key.split("||", 1)
+        ordered.append((group_title, values, style))
+    return ordered
+
+
+def _icon_letter_for_title(title: str) -> str:
+    key = (title or "").lower()
+    if "scenario" in key:
+        return "CS"
+    if "step" in key:
+        return "ST"
+    if "evidence" in key or "documentation" in key:
+        return "EV"
+    if "court" in key:
+        return "CT"
+    if "helpline" in key:
+        return "HP"
+    if "severity" in key or "risk" in key:
+        return "RS"
+    if "safety" in key:
+        return "SF"
+    return "IN"
+
+
+def _render_section_panel(title: str, section_text: str) -> None:
+    items = _section_items_from_text(section_text)
+    grouped = _group_section_items(title, items)
+    icon = _icon_letter_for_title(title)
+    st.markdown(
+        (
+            "<div class='va-panel'>"
+            "<div class='va-panel-head'>"
+            f"<span class='va-panel-icon'>{escape(icon)}</span>"
+            f"<span class='va-panel-title'>{escape(title)}</span>"
+            "</div>"
+            "<div class='va-panel-body'>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if grouped:
+        for group_title, values, style in grouped:
+            list_items = "".join(f"<li>{escape(value)}</li>" for value in values)
+            st.markdown(
+                (
+                    "<div class='va-subsection'>"
+                    f"<div class='va-sub-title {escape(style)}'>{escape(group_title)}</div>"
+                    f"<ul class='va-item-list'>{list_items}</ul>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+    else:
+        st.markdown("No details available for this section.")
+
+    st.markdown("</div></div>", unsafe_allow_html=True)
+
+
 def _render_tabs(result: Dict[str, Any]) -> None:
     tabs = st.tabs([
         "Overview",
-        "Legal Sections",
+        "Steps",
+        "Evidence",
+        "Courts",
         "Flowchart",
         "Safety",
         "Retrieval",
-        "Structured JSON",
-        "Audio Output",
+        "JSON",
+        "Audio",
     ])
 
     with tabs[0]:
-        st.text_area("Transcript / Final Query", result.get("transcript", ""), height=120)
-        st.text_area("Final Advisor Text", result.get("final_text", ""), height=200)
+        _render_section_panel("Transcript / Final Query", result.get("transcript", ""))
+        _render_section_panel("Final Advisor Text", result.get("final_text", ""))
+        _render_section_panel("Case Scenario", result.get("case_scenario_text", ""))
 
     with tabs[1]:
-        st.text_area("Case Scenario", result.get("case_scenario_text", ""), height=160)
-        st.text_area("Possible Steps", result.get("possible_steps_text", ""), height=160)
-        st.text_area("Required Documentation", result.get("required_docs_text", ""), height=140)
-        st.text_area("Courts and Filing Process", result.get("courts_process_text", ""), height=140)
-        st.text_area("Severity Assessment", result.get("severity_text", ""), height=120)
-        st.text_area("India Helplines", result.get("helplines_text", ""), height=120)
+        _render_section_panel("Possible Steps", result.get("possible_steps_text", ""))
+        explanation_lines = result.get("flowchart_explanation_lines", []) or []
+        if explanation_lines:
+            st.markdown("Flow Translation:")
+            for line in explanation_lines:
+                st.markdown(f"- {line}")
 
     with tabs[2]:
+        _render_section_panel("Required Documentation (Evidence)", result.get("required_docs_text", ""))
+
+    with tabs[3]:
+        _render_section_panel("Courts and Filing Process", result.get("courts_process_text", ""))
+        _render_section_panel("India Helplines", result.get("helplines_text", ""))
+        _render_section_panel("Severity Assessment", result.get("severity_text", ""))
+
+    with tabs[4]:
         graph_json_text = result.get("flowchart_graph_json", "{}")
         try:
             graph_data = json.loads(graph_json_text)
@@ -943,7 +1317,7 @@ def _render_tabs(result: Dict[str, Any]) -> None:
                 else:
                     st.info("No flowchart explanation available for this query.")
 
-    with tabs[3]:
+    with tabs[5]:
         safety_data = result.get("safety_data", {}) or {}
         risk_flags = list(safety_data.get("risk_flags", []) or [])
         safe_next_steps = list(safety_data.get("safe_next_steps", []) or [])
@@ -968,19 +1342,20 @@ def _render_tabs(result: Dict[str, Any]) -> None:
         if disclaimer:
             st.info(disclaimer)
 
-    with tabs[4]:
+    with tabs[6]:
         table = result.get("passage_table", [])
         if table:
             st.dataframe(table, use_container_width=True)
         else:
             st.write("No passages returned.")
 
-    with tabs[5]:
+    with tabs[7]:
         st.code(result.get("structured_json", "{}"), language="json")
-        st.code(result.get("raw_json", "{}"), language="json")
+        with st.expander("Raw Pipeline JSON", expanded=False):
+            st.code(result.get("raw_json", "{}"), language="json")
 
-    with tabs[6]:
-        st.text_area("TTS Summary (Spoken)", result.get("tts_summary_text", ""), height=100)
+    with tabs[8]:
+        _render_section_panel("TTS Summary (Spoken)", result.get("tts_summary_text", ""))
         if result.get("tts_path"):
             audio_file = result["tts_path"]
             try:
@@ -993,22 +1368,34 @@ def _render_tabs(result: Dict[str, Any]) -> None:
 
 
 def _sidebar_controls() -> Dict[str, Any]:
-    st.sidebar.header("Controls")
-    input_mode = st.sidebar.radio("Input Mode", ["Auto", "Text", "Audio"], index=0)
-    top_k = st.sidebar.slider("Retriever Top-K", min_value=1, max_value=10, value=5, step=1)
-    advisor_provider = st.sidebar.selectbox("Advisor Provider", ["auto", "grok", "fallback"], index=0)
-    enable_tts = st.sidebar.checkbox("Enable TTS", value=True)
-    tts_engine = st.sidebar.selectbox("TTS Engine", ["edge_tts", "pyttsx3"], index=0)
-    tts_fallback = st.sidebar.selectbox("TTS Fallback Engine", ["pyttsx3", "edge_tts"], index=0)
+    st.sidebar.header("Assistant Settings")
+    st.sidebar.caption("Choose how you want to ask, receive, and verify legal guidance.")
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("Speech-to-Text")
-    stt_model_name = st.sidebar.text_input("STT Model", value="distil-large-v3")
-    stt_model_dir = st.sidebar.text_input("STT Cache Dir", value="data/models/faster-whisper")
-    stt_local_only = st.sidebar.checkbox("STT Local Files Only", value=True)
+    with st.sidebar.expander("Input and Reasoning", expanded=True):
+        input_mode = st.radio("Input Mode", ["Auto", "Text", "Audio"], index=0, key="ui_input_mode")
+        top_k = st.slider("Evidence Depth (Top-K)", min_value=1, max_value=10, value=5, step=1, key="ui_top_k")
+        advisor_provider = st.selectbox(
+            "Reasoning Engine",
+            ["auto", "grok", "fallback"],
+            index=0,
+            format_func=lambda x: {"auto": "Auto (recommended)", "grok": "Grok", "fallback": "Deterministic fallback"}.get(x, x),
+            key="ui_provider",
+        )
 
-    st.sidebar.markdown("---")
-    if st.sidebar.button("Run Health Checks"):
+    with st.sidebar.expander("Audio and Speech", expanded=True):
+        enable_tts = st.checkbox("Enable spoken summary", value=True, key="ui_enable_tts")
+        tts_engine = st.selectbox("Primary TTS Engine", ["edge_tts", "pyttsx3"], index=0, key="ui_tts_engine")
+        tts_fallback = st.selectbox("Fallback TTS Engine", ["pyttsx3", "edge_tts"], index=0, key="ui_tts_fallback")
+        st.markdown("Speech-to-Text")
+        stt_model_name = st.text_input("STT Model", value="distil-large-v3", key="ui_stt_model")
+        stt_model_dir = st.text_input("STT Cache Directory", value="data/models/faster-whisper", key="ui_stt_dir")
+        stt_local_only = st.checkbox("Use local STT files only", value=True, key="ui_stt_local")
+
+    with st.sidebar.expander("Diagnostics", expanded=False):
+        st.caption("Use this if provider/retrieval seems unavailable.")
+        run_checks = st.button("Run Health Checks", key="ui_health_checks")
+
+    if run_checks:
         with st.spinner("Checking provider and retriever..."):
             ok_provider, msg_provider = health_check_provider()
             ok_retriever, msg_retriever = health_check_retriever(get_flow(top_k, advisor_provider))
@@ -1031,11 +1418,13 @@ def _sidebar_controls() -> Dict[str, Any]:
 def main() -> None:
     st.set_page_config(page_title="Veridiction Law Assistant (Streamlit)", layout="wide")
     Path("data/tts").mkdir(parents=True, exist_ok=True)
+    _inject_theme()
 
     st.title("Veridiction Law Assistant")
     st.caption("Voice/Text -> Legal Pipeline -> Structured Response -> TTS")
 
     controls = _sidebar_controls()
+    _render_pinned_audio_sidebar()
 
     st.markdown("### Input Console")
     query = st.text_area(
@@ -1046,12 +1435,40 @@ def main() -> None:
     )
 
     st.markdown("#### Voice Input")
+    if "audio_input_version" not in st.session_state:
+        st.session_state["audio_input_version"] = 0
+
+    recorder_col, clear_col = st.columns([5, 1])
     if hasattr(st, "audio_input"):
-        st.caption("Record directly from your microphone for real-time voice queries.")
-        audio_upload = st.audio_input("Tap to record voice")
+        with recorder_col:
+            st.caption("Record directly from your microphone for real-time voice queries.")
+            audio_upload = st.audio_input(
+                "Tap to record voice",
+                key=f"voice_recording_{st.session_state['audio_input_version']}",
+            )
+        with clear_col:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button("Discard", key="discard_recorded_audio", use_container_width=True):
+                st.session_state["audio_input_version"] += 1
+                st.session_state["audio_cleared_notice"] = True
+                st.rerun()
     else:
-        st.warning("This Streamlit version does not support direct microphone input. Upgrade Streamlit for real-time voice capture.")
-        audio_upload = st.file_uploader("Voice Input (fallback upload)", type=["wav", "mp3", "m4a", "flac"])
+        with recorder_col:
+            st.warning("This Streamlit version does not support direct microphone input. Upgrade Streamlit for real-time voice capture.")
+            audio_upload = st.file_uploader(
+                "Voice Input (fallback upload)",
+                type=["wav", "mp3", "m4a", "flac"],
+                key=f"voice_upload_{st.session_state['audio_input_version']}",
+            )
+        with clear_col:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+            if st.button("Clear", key="clear_uploaded_audio", use_container_width=True):
+                st.session_state["audio_input_version"] += 1
+                st.session_state["audio_cleared_notice"] = True
+                st.rerun()
+
+    if st.session_state.pop("audio_cleared_notice", False):
+        st.success("Audio input discarded. You can record again now.")
 
     example = st.selectbox(
         "Quick Examples",
@@ -1092,12 +1509,21 @@ def main() -> None:
                 progress_callback=_progress_update,
             )
 
+            st.session_state["latest_result"] = result
+
             progress.progress(100, text="100% - Completed")
-            _render_status_panel(result)
-            _render_tabs(result)
         except Exception as exc:
             st.error(f"Error: {exc}")
             st.code(traceback.format_exc())
+
+    latest_result = st.session_state.get("latest_result")
+    if latest_result:
+        st.markdown("---")
+        st.caption("Showing latest completed result")
+        _render_status_panel(latest_result)
+        _render_hero_summary(latest_result)
+        _render_quick_actions(latest_result)
+        _render_tabs(latest_result)
 
 
 if __name__ == "__main__":

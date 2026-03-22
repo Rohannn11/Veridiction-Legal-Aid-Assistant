@@ -25,11 +25,32 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 LOGGER = logging.getLogger(__name__)
 
 
-DEFAULT_DATASETS: tuple[str, ...] = (
+JUDGMENT_DATASETS: tuple[str, ...] = (
     "vihaannnn/Indian-Supreme-Court-Judgements-Chunked",
     "Subimal10/indian-legal-data-cleaned",
 )
+PROCEDURAL_DATASETS: tuple[str, ...] = (
+    "viber1/indian-law-dataset",
+    "ShreyasP123/Legal-Dataset-for-india",
+    "nisaar/Lawyer_GPT_India",
+)
 DEFAULT_EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+PROCEDURAL_INTENT_KEYWORDS: tuple[str, ...] = (
+    "how",
+    "which court",
+    "where to file",
+    "steps",
+    "procedure",
+    "process",
+    "fees",
+    "documents",
+    "docs",
+    "timeline",
+    "time limit",
+    "filing",
+    "jurisdiction",
+)
 
 # Domain-specific keyword expansion for better matching
 LEGAL_SYNONYMS: dict[str, list[str]] = {
@@ -59,11 +80,13 @@ class RetrieverError(RuntimeError):
 class RetrieverConfig:
     """Runtime configuration for building and querying the retriever."""
 
-    dataset_ids: tuple[str, ...] = DEFAULT_DATASETS
+    dataset_ids: tuple[str, ...] = JUDGMENT_DATASETS
+    procedural_dataset_ids: tuple[str, ...] = PROCEDURAL_DATASETS
     split: str = "train"
     top_k: int = 5
     embedding_model_name: str = DEFAULT_EMBED_MODEL
     persist_dir: Path = Path("data") / "vector_index"
+    judgment_persist_dir: Path = Path("data") / "vector_index"
     hf_cache_dir: Path = Path("data") / "hf_cache"
     hf_token: str | None = None
     min_confidence: float = 0.20
@@ -71,6 +94,8 @@ class RetrieverConfig:
     phrase_boost: float = 0.50   # Bonus for phrase matches
     synonym_boost: float = 0.15  # Bonus for synonym matches
     tfidf_enabled: bool = True   # Use TF-IDF weighting
+    procedural_streaming: bool = True  # Stream procedural datasets to reduce local disk usage
+    procedural_max_documents: int = 3500  # Limit memory usage for procedural corpus
 
 
 class LegalRetriever:
@@ -101,9 +126,13 @@ class LegalRetriever:
 
     def __init__(self, config: RetrieverConfig | None = None) -> None:
         self.config = config or RetrieverConfig()
+        if self.config.persist_dir != Path("data") / "vector_index":
+            self.config.judgment_persist_dir = self.config.persist_dir
         self._index: VectorStoreIndex | None = None
+        self._judgment_index: VectorStoreIndex | None = None
         self._idf_dict: dict[str, float] = {}  # Cached IDF values
         self._all_documents: list[Document] = []  # For IDF calculation
+        self._procedural_corpus: list[dict[str, Any]] | None = None
         token = self._get_hf_token()
         if token and not os.getenv("HF_TOKEN"):
             os.environ["HF_TOKEN"] = token
@@ -115,18 +144,19 @@ class LegalRetriever:
         max_documents: int | None = None,
     ) -> VectorStoreIndex:
         """Load an existing index from disk or build one from datasets."""
-        persist_dir = self.config.persist_dir
+        persist_dir = self.config.judgment_persist_dir
         if persist_dir.exists() and not force_rebuild:
             LOGGER.info("Loading existing vector index from %s", persist_dir)
             storage_context = StorageContext.from_defaults(persist_dir=str(persist_dir))
-            self._index = load_index_from_storage(storage_context, embed_model=self._embed_model)
-            return self._index
+            self._judgment_index = load_index_from_storage(storage_context, embed_model=self._embed_model)
+            self._index = self._judgment_index
+            return self._judgment_index
 
         return self.build_index(max_documents=max_documents)
 
     def build_index(self, max_documents: int | None = None) -> VectorStoreIndex:
         """Build and persist a fresh vector index from configured datasets."""
-        persist_dir = self.config.persist_dir
+        persist_dir = self.config.judgment_persist_dir
         hf_cache_dir = self.config.hf_cache_dir
         persist_dir.mkdir(parents=True, exist_ok=True)
         hf_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -143,14 +173,15 @@ class LegalRetriever:
             self._calculate_idf(documents)
 
         LOGGER.info("Creating vector index with %d documents", len(documents))
-        self._index = VectorStoreIndex.from_documents(
+        self._judgment_index = VectorStoreIndex.from_documents(
             documents,
             embed_model=self._embed_model,
             show_progress=True,
         )
-        self._index.storage_context.persist(str(persist_dir))
+        self._judgment_index.storage_context.persist(str(persist_dir))
+        self._index = self._judgment_index
         LOGGER.info("Index persisted to %s", persist_dir)
-        return self._index
+        return self._judgment_index
     
     def _calculate_idf(self, documents: list[Document]) -> None:
         """Calculate inverse document frequency for all keywords in the corpus."""
@@ -173,53 +204,147 @@ class LegalRetriever:
         LOGGER.info("Calculated IDF for %d unique terms", len(self._idf_dict))
 
     def query(self, user_query: str, top_k: int | None = None) -> list[dict[str, Any]]:
-        """Return top-k relevant legal passages with advanced keyword-boosted scores."""
+        """Return top-k passages from routed dual-index retrieval (judgment + procedural)."""
         if not user_query or not user_query.strip():
             raise ValueError("Query cannot be empty.")
 
-        if self._index is None:
+        similarity_top_k = top_k if top_k is not None else self.config.top_k
+        procedural_intent = self._is_procedural_intent(user_query)
+
+        if procedural_intent:
+            procedural_k = max(2, similarity_top_k)
+            judgment_k = max(2, similarity_top_k // 2)
+        else:
+            procedural_k = max(1, similarity_top_k // 2)
+            judgment_k = max(2, similarity_top_k)
+
+        judgment_results = self._query_judgment_index(user_query=user_query, top_k=judgment_k)
+        procedural_results = self._query_procedural_index(user_query=user_query, top_k=procedural_k)
+
+        merged = self._merge_dual_results(
+            query=user_query,
+            judgment_results=judgment_results,
+            procedural_results=procedural_results,
+            top_k=similarity_top_k,
+            procedural_intent=procedural_intent,
+        )
+        return merged
+
+    def _is_procedural_intent(self, query: str) -> bool:
+        lowered = query.lower()
+        return any(token in lowered for token in PROCEDURAL_INTENT_KEYWORDS)
+
+    def _query_judgment_index(self, user_query: str, top_k: int) -> list[dict[str, Any]]:
+        if self._judgment_index is None:
             self.load_or_build_index(force_rebuild=False)
 
-        if self._index is None:
-            raise RetrieverError("Retriever index could not be initialized.")
+        if self._judgment_index is None:
+            raise RetrieverError("Judgment index could not be initialized.")
 
-        similarity_top_k = top_k if top_k is not None else self.config.top_k
-        
-        # Fetch 5x candidates for aggressive re-ranking
-        retriever = self._index.as_retriever(similarity_top_k=similarity_top_k * 5)
+        retriever = self._judgment_index.as_retriever(similarity_top_k=max(1, top_k) * 5)
         nodes = retriever.retrieve(user_query)
-        
-        # Advanced keyword re-ranking
+
         keywords = self._extract_keywords_advanced(user_query)
         phrases = self._extract_phrases(user_query)
         expanded_keywords = self._expand_with_synonyms(keywords)
-        
+
         boosted_nodes = self._boost_by_keywords_advanced(
-            nodes, 
-            keywords, 
-            phrases, 
-            expanded_keywords
+            nodes,
+            keywords,
+            phrases,
+            expanded_keywords,
         )
-        
-        # Re-sort and calibrate scores
-        final_nodes = sorted(
-            boosted_nodes, 
-            key=lambda n: float(n.score or 0.0), 
-            reverse=True
-        )[:similarity_top_k]
-        
-        # Normalize scores to 0.80-0.95 range for high-quality results
+        final_nodes = sorted(boosted_nodes, key=lambda n: float(n.score or 0.0), reverse=True)[:max(1, top_k)]
         final_nodes = self._calibrate_scores(final_nodes)
-        
+
         results: list[dict[str, Any]] = []
         for node in final_nodes:
-            # Access text from node correctly
-            text = node.node.text if hasattr(node.node, 'text') else str(node.node)
+            text = node.node.text if hasattr(node.node, "text") else str(node.node)
             text = text.strip() if text else ""
             metadata = dict(getattr(node.node, "metadata", {}) or {})
-            score = float(node.score) if node.score is not None else None
+            metadata["source_index"] = "judgment_index"
+            metadata["source_label"] = "Judgment Index"
+            score = float(node.score) if node.score is not None else 0.0
             results.append({"passage": text, "metadata": metadata, "score": score})
         return results
+
+    def _query_procedural_index(self, user_query: str, top_k: int) -> list[dict[str, Any]]:
+        corpus = self._load_procedural_corpus(max_documents=self.config.procedural_max_documents)
+        if not corpus:
+            return []
+
+        keywords = self._extract_keywords_advanced(user_query)
+        phrases = self._extract_phrases(user_query)
+        expanded = self._expand_with_synonyms(keywords)
+
+        scored: list[dict[str, Any]] = []
+        for row in corpus:
+            text = str(row.get("text", "")).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            score = 0.0
+
+            for phrase in phrases:
+                if phrase in lowered:
+                    score += self.config.phrase_boost * 1.1
+
+            for keyword in keywords:
+                if re.search(rf"\b{re.escape(keyword)}\b", lowered):
+                    score += self.config.keyword_boost
+
+            for keyword, synonyms in expanded.items():
+                for synonym in synonyms[1:]:
+                    if re.search(rf"\b{re.escape(synonym)}\b", lowered):
+                        score += self.config.synonym_boost
+
+            if score <= 0:
+                continue
+
+            metadata = dict(row.get("metadata", {}) or {})
+            metadata["source_index"] = "procedural_index"
+            metadata["source_label"] = "Procedural Index"
+            scored.append({"passage": text, "metadata": metadata, "score": min(score, 1.0)})
+
+        scored = sorted(scored, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return scored[:max(1, top_k)]
+
+    def _merge_dual_results(
+        self,
+        query: str,
+        judgment_results: list[dict[str, Any]],
+        procedural_results: list[dict[str, Any]],
+        top_k: int,
+        procedural_intent: bool,
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _add(items: list[dict[str, Any]], source_bias: float = 0.0) -> None:
+            for item in items:
+                passage = str(item.get("passage", "")).strip()
+                if not passage:
+                    continue
+                key = " ".join(passage.lower().split())[:320]
+                if key in seen:
+                    continue
+                seen.add(key)
+                score = float(item.get("score", 0.0)) + source_bias
+                merged.append({
+                    "passage": passage,
+                    "metadata": item.get("metadata", {}) or {},
+                    "score": min(score, 1.0),
+                })
+
+        if procedural_intent:
+            _add(procedural_results, source_bias=0.08)
+            _add(judgment_results, source_bias=0.0)
+        else:
+            _add(judgment_results, source_bias=0.05)
+            _add(procedural_results, source_bias=0.0)
+
+        merged = sorted(merged, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return merged[:max(1, top_k)]
     
     def _calibrate_scores(self, nodes: list) -> list:
         """Normalize scores to 0.80-0.95 range for high-quality results."""
@@ -372,6 +497,57 @@ class LegalRetriever:
                 if max_documents is not None and loaded >= max_documents:
                     LOGGER.info("Reached max_documents=%d", max_documents)
                     return
+
+    def _load_procedural_corpus(self, max_documents: int | None = None) -> list[dict[str, Any]]:
+        """Load procedural corpus in streaming mode to avoid large local disk usage."""
+        if self._procedural_corpus is not None:
+            return self._procedural_corpus
+
+        token = self._get_hf_token()
+        max_docs = max_documents if max_documents is not None else self.config.procedural_max_documents
+        dataset_count = max(1, len(self.config.procedural_dataset_ids))
+        per_dataset_limit = max(150, max_docs // dataset_count)
+
+        corpus: list[dict[str, Any]] = []
+        seen_texts: set[str] = set()
+
+        for dataset_id in self.config.procedural_dataset_ids:
+            LOGGER.info("Loading procedural dataset (streaming=%s): %s", self.config.procedural_streaming, dataset_id)
+            dataset_obj = load_dataset(
+                dataset_id,
+                split=self.config.split,
+                token=token,
+                cache_dir=str(self.config.hf_cache_dir),
+                streaming=self.config.procedural_streaming,
+            )
+
+            loaded_for_dataset = 0
+            for row in dataset_obj:
+                text = self._extract_text(row)
+                if not text:
+                    continue
+
+                normalized = " ".join(text.split())
+                if normalized in seen_texts:
+                    continue
+                seen_texts.add(normalized)
+
+                metadata = self._extract_metadata(row)
+                metadata["dataset"] = dataset_id
+                corpus.append({"text": text, "metadata": metadata})
+                loaded_for_dataset += 1
+
+                if loaded_for_dataset >= per_dataset_limit:
+                    break
+                if len(corpus) >= max_docs:
+                    break
+
+            if len(corpus) >= max_docs:
+                break
+
+        self._procedural_corpus = corpus
+        LOGGER.info("Procedural corpus loaded in-memory with %d passages", len(corpus))
+        return corpus
 
     def _resolve_dataset(self, dataset_obj: Dataset | DatasetDict, split: str) -> Dataset:
         """Support both Dataset and DatasetDict returns from load_dataset."""
