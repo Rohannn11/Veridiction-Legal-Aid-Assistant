@@ -8,7 +8,9 @@ structured sections, retrieval table, audio playback, and health checks.
 from __future__ import annotations
 
 import json
+import importlib
 import os
+import re
 import tempfile
 import time
 import traceback
@@ -130,6 +132,384 @@ def _build_structured_json(output: Dict[str, Any], elapsed_ms: float) -> Dict[st
     return structured
 
 
+def _classify_flow_node_type(title: str, details: str) -> str:
+    text = f"{title} {details}".lower()
+    if any(token in text for token in ("emergency", "danger", "safety", "112", "helpline")):
+        return "emergency"
+    if any(token in text for token in ("document", "evidence", "proof", "records", "paper")):
+        return "documentation"
+    if any(token in text for token in ("file", "complaint", "fir", "petition", "application", "notice")):
+        return "filing"
+    if any(token in text for token in ("hearing", "follow", "comply", "order", "appear")):
+        return "follow_up"
+    return "action"
+
+
+def _sanitize_flow_title(title: str, details: str, idx: int) -> str:
+    raw = (title or "").strip()
+    if not raw or re.fullmatch(r"step\s*\d+", raw, flags=re.IGNORECASE):
+        detail_words = [w for w in re.split(r"\s+", (details or "").strip()) if w]
+        if detail_words:
+            short = " ".join(detail_words[:4]).strip(".,;: ")
+            return short.title()
+        return f"Action {idx}"
+    return raw
+
+
+def _wrap_text_for_node(text: str, max_len: int = 32) -> str:
+    words = text.split()
+    if not words:
+        return ""
+    lines: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    for word in words:
+        add_len = len(word) if not current else len(word) + 1
+        if current_len + add_len > max_len:
+            lines.append(" ".join(current))
+            current = [word]
+            current_len = len(word)
+        else:
+            current.append(word)
+            current_len += add_len
+    if current:
+        lines.append(" ".join(current))
+    return "<br>".join(lines[:3])
+
+
+def _build_flow_explanation_lines(graph_data: Dict[str, Any]) -> List[str]:
+    nodes = sorted(list(graph_data.get("nodes", [])), key=lambda x: int(x.get("order", 0)))
+    lines: List[str] = []
+    for node in nodes:
+        node_type = str(node.get("type", "action"))
+        if node_type in {"start", "end"}:
+            continue
+        order = int(node.get("order", 0))
+        title = str(node.get("title", "")).strip()
+        details = str(node.get("details", "")).strip()
+        if title and details:
+            lines.append(f"{order}. {title}: {details}")
+        elif details:
+            lines.append(f"{order}. {details}")
+        elif title:
+            lines.append(f"{order}. {title}")
+    return lines
+
+
+def _build_flow_explanation_items(graph_data: Dict[str, Any]) -> List[Dict[str, str]]:
+    nodes = sorted(list(graph_data.get("nodes", [])), key=lambda x: int(x.get("order", 0)))
+    items: List[Dict[str, str]] = []
+    for node in nodes:
+        node_type = str(node.get("type", "action"))
+        if node_type in {"start", "end"}:
+            continue
+        order = int(node.get("order", 0))
+        title = str(node.get("title", "")).strip() or "Action"
+        details = str(node.get("details", "")).strip() or "Proceed with this step."
+        items.append(
+            {
+                "step": str(order),
+                "title": title,
+                "details": details,
+                "type": node_type,
+            }
+        )
+    return items
+
+
+def _node_fill_color(node_type: str) -> str:
+    palette = {
+        "start": "#D9F2FF",
+        "end": "#DDF8E8",
+        "emergency": "#FFD7D7",
+        "documentation": "#FDECC8",
+        "filing": "#E4E0FF",
+        "follow_up": "#E0F0FF",
+        "action": "#F0F4F8",
+    }
+    return palette.get(node_type, "#F0F4F8")
+
+
+def _risk_border_color(severity_level: str, urgency: str) -> str:
+    sev = (severity_level or "").lower()
+    urg = (urgency or "").lower()
+    if sev == "critical":
+        return "#B00020"
+    if sev == "high" or urg == "high":
+        return "#D35400"
+    if sev == "medium" or urg == "medium":
+        return "#A15C00"
+    return "#2E7D32"
+
+
+def _build_flowchart_graph_data(
+    structured_response: Dict[str, Any],
+    urgency: str,
+    risk_flags: List[str],
+    safe_next_steps: List[str],
+) -> Dict[str, Any]:
+    flow_steps = structured_response.get("flowchart", []) or []
+    severity = structured_response.get("severity_assessment", {}) or {}
+    severity_level = str(severity.get("level", urgency or "medium"))
+    border_color = _risk_border_color(severity_level=severity_level, urgency=urgency)
+
+    risk_flag_set = {str(x).lower() for x in risk_flags}
+    has_immediate_risk = any(x in risk_flag_set for x in ("immediate_danger", "domestic_violence_risk", "high_urgency"))
+    emergency_detail = (
+        str(safe_next_steps[0]).strip()
+        if safe_next_steps
+        else "Call 112 and move to a safe place before proceeding with legal filing."
+    )
+
+    nodes: List[Dict[str, Any]] = [
+        {
+            "id": "start",
+            "label": "Case Intake",
+            "title": "Case Intake",
+            "details": "User issue captured and legal triage started.",
+            "type": "start",
+            "order": 0,
+            "fill_color": _node_fill_color("start"),
+            "border_color": border_color,
+        }
+    ]
+
+    nodes.append(
+        {
+            "id": "decision_risk",
+            "label": "Immediate Risk Check",
+            "title": "Immediate danger or threat present?",
+            "details": (
+                "Risk indicators detected; emergency actions should be prioritized first."
+                if has_immediate_risk
+                else "No immediate physical danger detected; proceed through standard legal steps."
+            ),
+            "type": "decision",
+            "order": 1,
+            "fill_color": "#FFF3CD",
+            "border_color": border_color,
+        }
+    )
+
+    nodes.append(
+        {
+            "id": "emergency_action",
+            "label": "Emergency Action",
+            "title": "Emergency action",
+            "details": emergency_detail,
+            "type": "emergency",
+            "order": 2,
+            "fill_color": _node_fill_color("emergency"),
+            "border_color": border_color,
+        }
+    )
+
+    for idx, raw in enumerate(flow_steps, start=1):
+        details = str(raw.get("details", "")).strip() or "Proceed with this action."
+        title = _sanitize_flow_title(str(raw.get("title", f"Step {idx}")), details, idx)
+        node_type = _classify_flow_node_type(title=title, details=details)
+        nodes.append(
+            {
+                "id": f"step_{idx}",
+                "label": title,
+                "title": title,
+                "details": details,
+                "type": node_type,
+                "order": idx + 2,
+                "fill_color": _node_fill_color(node_type),
+                "border_color": border_color,
+            }
+        )
+
+    end_order = len(flow_steps) + 3
+    nodes.append(
+        {
+            "id": "end",
+            "label": "Next Legal Milestone",
+            "title": "Next Legal Milestone",
+            "details": "Submit, track, and act on authority/court response.",
+            "type": "end",
+            "order": end_order,
+            "fill_color": _node_fill_color("end"),
+            "border_color": border_color,
+        }
+    )
+
+    edges: List[Dict[str, Any]] = []
+
+    process_ids = [f"step_{idx}" for idx in range(1, len(flow_steps) + 1)]
+    first_process = process_ids[0] if process_ids else "end"
+
+    edges.append({"id": "edge_1", "source": "start", "target": "decision_risk", "label": "intake"})
+    edges.append({"id": "edge_2", "source": "decision_risk", "target": "emergency_action", "label": "Yes"})
+    edges.append({"id": "edge_3", "source": "decision_risk", "target": first_process, "label": "No"})
+    edges.append({"id": "edge_4", "source": "emergency_action", "target": first_process, "label": "After safety"})
+
+    for idx in range(len(process_ids) - 1):
+        edges.append(
+            {
+                "id": f"edge_process_{idx + 1}",
+                "source": process_ids[idx],
+                "target": process_ids[idx + 1],
+                "label": "next",
+            }
+        )
+
+    edges.append(
+        {
+            "id": "edge_end",
+            "source": process_ids[-1] if process_ids else "emergency_action",
+            "target": "end",
+            "label": "submit",
+        }
+    )
+
+    return {
+        "meta": {
+            "severity_level": severity_level,
+            "urgency": urgency,
+            "risk_flags": risk_flags,
+            "layout": "left_to_right_dag",
+        },
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
+def _render_flowchart_graphviz(graph_data: Dict[str, Any]) -> bool:
+    try:
+        graphviz = importlib.import_module("graphviz")
+    except Exception:
+        return False
+
+    nodes = sorted(list(graph_data.get("nodes", [])), key=lambda x: int(x.get("order", 0)))
+    edges = list(graph_data.get("edges", []))
+    meta = graph_data.get("meta", {}) or {}
+    if not nodes:
+        return False
+
+    shape_map = {
+        "start": "ellipse",
+        "end": "ellipse",
+        "decision": "diamond",
+        "emergency": "box",
+        "documentation": "box",
+        "filing": "box",
+        "follow_up": "box",
+        "action": "box",
+    }
+
+    dot = graphviz.Digraph("legal_flow", graph_attr={"rankdir": "LR", "splines": "spline", "nodesep": "0.55", "ranksep": "0.8"})
+    dot.attr("node", style="filled", fontname="Helvetica", fontsize="10", color="#A15C00", penwidth="2")
+    dot.attr("edge", color="#6B7280", penwidth="1.6", fontname="Helvetica", fontsize="10")
+
+    for node in nodes:
+        node_id = str(node.get("id", ""))
+        if not node_id:
+            continue
+        node_type = str(node.get("type", "action"))
+        title = str(node.get("title", "")).strip() or str(node.get("label", "Action")).strip() or "Action"
+        label = _wrap_text_for_node(title, max_len=18).replace("<br>", "\\n")
+        dot.node(
+            node_id,
+            label=label,
+            shape=shape_map.get(node_type, "box"),
+            fillcolor=str(node.get("fill_color", "#F0F4F8")),
+        )
+
+    for edge in edges:
+        src = str(edge.get("source", ""))
+        dst = str(edge.get("target", ""))
+        if not src or not dst:
+            continue
+        label = str(edge.get("label", "")).strip()
+        dot.edge(src, dst, label=label)
+
+    st.caption(
+        "Flowchart: standard symbols are used (Oval = Start/End, Diamond = Decision, Rectangle = Process). "
+        f"Urgency: {meta.get('urgency', 'medium')} | Severity: {meta.get('severity_level', 'medium')}"
+    )
+    st.graphviz_chart(dot)
+    return True
+
+
+def _render_flowchart_native(graph_data: Dict[str, Any]) -> bool:
+    nodes = sorted(list(graph_data.get("nodes", [])), key=lambda x: int(x.get("order", 0)))
+    if not nodes:
+        return False
+
+    by_id = {str(n.get("id", "")): n for n in nodes}
+
+    def _card(title: str, details: str, bg: str = "#F8FAFC") -> str:
+        safe_title = escape((title or "Action").strip())
+        safe_details = escape((details or "Proceed with this step.").strip())
+        return (
+            f"<div style='min-width:200px;max-width:260px;border:2px solid #A15C00;"
+            f"border-radius:10px;padding:10px 12px;background:{bg};margin:6px;'>"
+            f"<div style='font-weight:700;color:#1F2937;margin-bottom:6px'>{safe_title}</div>"
+            f"<div style='color:#374151;font-size:13px;line-height:1.25'>{safe_details}</div>"
+            "</div>"
+        )
+
+    def _arrow(label: str = "") -> str:
+        safe_label = escape(label)
+        label_html = f"<div style='font-size:12px;color:#4B5563'>{safe_label}</div>" if safe_label else ""
+        return (
+            "<div style='display:flex;flex-direction:column;align-items:center;justify-content:center;"
+            "min-width:42px;margin:0 4px;'>"
+            f"{label_html}"
+            "<div style='font-size:24px;color:#6B7280;line-height:1'>→</div>"
+            "</div>"
+        )
+
+    start = by_id.get("start", {"title": "Case Intake", "details": "Issue captured."})
+    decision = by_id.get("decision_risk", {"title": "Risk Check", "details": "Assess immediate danger."})
+    emergency = by_id.get("emergency_action", {"title": "Emergency Action", "details": "Take urgent safety action."})
+    end = by_id.get("end", {"title": "Next Legal Milestone", "details": "Submit and track response."})
+    process_nodes = [n for n in nodes if str(n.get("id", "")).startswith("step_")]
+
+    main_parts: List[str] = [
+        _card(str(start.get("title", "Case Intake")), str(start.get("details", "Issue captured.")), "#D9F2FF"),
+        _arrow(),
+        _card(str(decision.get("title", "Immediate danger or threat present?")), str(decision.get("details", "")), "#FFF3CD"),
+        _arrow("No"),
+    ]
+    for idx, node in enumerate(process_nodes):
+        main_parts.append(_card(str(node.get("title", "Action")), str(node.get("details", "")), str(node.get("fill_color", "#F0F4F8"))))
+        if idx < len(process_nodes) - 1:
+            main_parts.append(_arrow())
+    if process_nodes:
+        main_parts.append(_arrow())
+    main_parts.append(_card(str(end.get("title", "Next Legal Milestone")), str(end.get("details", "")), "#DDF8E8"))
+
+    emergency_parts: List[str] = [
+        _card(str(decision.get("title", "Immediate danger or threat present?")), str(decision.get("details", "")), "#FFF3CD"),
+        _arrow("Yes"),
+        _card(str(emergency.get("title", "Emergency Action")), str(emergency.get("details", "")), "#FFD7D7"),
+    ]
+    if process_nodes:
+        emergency_parts.extend([_arrow("Then continue"), _card(str(process_nodes[0].get("title", "Action")), str(process_nodes[0].get("details", "")), str(process_nodes[0].get("fill_color", "#F0F4F8")))])
+
+    st.caption("Standard flow view with explicit No/Yes decision branches.")
+    st.markdown(
+        "<div style='font-weight:700;color:#111827;margin:4px 0 6px;'>Main Legal Path</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:4px;'>" + "".join(main_parts) + "</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='font-weight:700;color:#111827;margin:12px 0 6px;'>Emergency Branch</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;align-items:center;gap:4px;'>" + "".join(emergency_parts) + "</div>",
+        unsafe_allow_html=True,
+    )
+    return True
+
+
 def _section_to_text(title: str, lines: List[str]) -> str:
     if not lines:
         return f"{title}:\n- Not available"
@@ -245,7 +625,20 @@ def _extract_structured_sections(structured: Dict[str, Any]) -> Tuple[str, str, 
         for h in helplines
     ]
 
-    flow_lines = [f"Step {s.get('step', '')}: {s.get('title', '')} - {s.get('details', '')}" for s in flowchart]
+    flow_lines: List[str] = []
+    for idx, step in enumerate(flowchart, start=1):
+        step_no = step.get("step", idx)
+        title = str(step.get("title", "")).strip()
+        details = str(step.get("details", "")).strip()
+        if title and re.fullmatch(r"step\s*\d+", title, flags=re.IGNORECASE):
+            line = f"{step_no}. {details}" if details else f"{step_no}."
+        elif title and details:
+            line = f"{step_no}. {title}: {details}"
+        elif details:
+            line = f"{step_no}. {details}"
+        else:
+            line = f"{step_no}."
+        flow_lines.append(line)
 
     return (
         _section_to_text("Case Scenario", [x for x in scenario_lines if x]),
@@ -393,6 +786,16 @@ def run_pipeline(
         structured_response["tts_summary"] = dynamic_tts_summary
         output["structured_response"] = structured_response
 
+    risk_flags = [str(x) for x in (output.get("safety", {}) or {}).get("risk_flags", [])]
+    safe_next_steps = [str(x) for x in (output.get("safety", {}) or {}).get("safe_next_steps", [])]
+    flowchart_graph_data = _build_flowchart_graph_data(
+        structured_response=structured_response,
+        urgency=str(output.get("urgency", "medium")),
+        risk_flags=risk_flags,
+        safe_next_steps=safe_next_steps,
+    )
+    output["flowchart_graph"] = flowchart_graph_data
+
     tts_path: Optional[str] = None
     if enable_tts:
         _emit_progress(progress_callback, 80, "Generating speech output")
@@ -417,6 +820,7 @@ def run_pipeline(
     passages = output.get("retrieved_passages", []) or []
     passage_table = _format_passages_for_table(passages)
     structured = _build_structured_json(output, elapsed_ms)
+    structured["flowchart_graph"] = flowchart_graph_data
     structured_response = output.get("structured_response", {}) or {}
     (
         case_scenario_text,
@@ -429,6 +833,7 @@ def run_pipeline(
         tts_summary_text,
     ) = _extract_structured_sections(structured_response)
     safety = output.get("safety", {}) or {}
+    flow_explanation_lines = _build_flow_explanation_lines(flowchart_graph_data)
 
     status = (
         "Run completed successfully. "
@@ -452,11 +857,14 @@ def run_pipeline(
         "severity_text": severity_text,
         "helplines_text": helplines_text,
         "flowchart_text": flowchart_text,
+        "flowchart_explanation_lines": flow_explanation_lines,
         "tts_summary_text": tts_summary_text,
+        "safety_data": safety,
         "safety_json": json.dumps(safety, ensure_ascii=True, indent=2),
         "passage_table": passage_table,
         "structured_json": json.dumps(structured, ensure_ascii=True, indent=2),
         "raw_json": json.dumps(output, ensure_ascii=True, indent=2),
+        "flowchart_graph_json": json.dumps(flowchart_graph_data, ensure_ascii=True, indent=2),
         "tts_path": tts_path,
         "status": status,
     }
@@ -480,7 +888,7 @@ def _render_tabs(result: Dict[str, Any]) -> None:
     tabs = st.tabs([
         "Overview",
         "Legal Sections",
-        "Flowchart (text only)",
+        "Flowchart",
         "Safety",
         "Retrieval",
         "Structured JSON",
@@ -500,11 +908,65 @@ def _render_tabs(result: Dict[str, Any]) -> None:
         st.text_area("India Helplines", result.get("helplines_text", ""), height=120)
 
     with tabs[2]:
-        st.text_area("Flowchart (Text Steps)", result.get("flowchart_text", ""), height=200)
-        st.info("Graphical flowchart coming in Step 2 (pyvis/Plotly replacement for Mermaid).")
+        graph_json_text = result.get("flowchart_graph_json", "{}")
+        try:
+            graph_data = json.loads(graph_json_text)
+        except Exception:
+            graph_data = {}
+
+        rendered = _render_flowchart_graphviz(graph_data)
+        if not rendered:
+            rendered = _render_flowchart_native(graph_data)
+        if not rendered:
+            st.warning("Flowchart rendering unavailable for this response. Showing detailed step explanation.")
+
+        st.subheader("Step-by-Step Explanation")
+        explanation_items = _build_flow_explanation_items(graph_data)
+        if explanation_items:
+            for item in explanation_items:
+                step = item.get("step", "")
+                title = item.get("title", "Action")
+                details = item.get("details", "Proceed with this step.")
+                node_type = str(item.get("type", "action")).replace("_", " ").title()
+                with st.expander(f"Step {step}: {title}", expanded=True):
+                    st.markdown(f"Type: {node_type}")
+                    st.markdown(details)
+        else:
+            explanation_lines = result.get("flowchart_explanation_lines", []) or []
+            if explanation_lines:
+                for line in explanation_lines:
+                    st.markdown(f"- {line}")
+            else:
+                fallback_text = str(result.get("flowchart_text", "")).strip()
+                if fallback_text:
+                    st.markdown(fallback_text.replace("\n", "  \n"))
+                else:
+                    st.info("No flowchart explanation available for this query.")
 
     with tabs[3]:
-        st.code(result.get("safety_json", "{}"), language="json")
+        safety_data = result.get("safety_data", {}) or {}
+        risk_flags = list(safety_data.get("risk_flags", []) or [])
+        safe_next_steps = list(safety_data.get("safe_next_steps", []) or [])
+        disclaimer = str(safety_data.get("disclaimer", "")).strip()
+
+        st.subheader("Safety Guidance")
+        if risk_flags:
+            st.error("Potential safety risks detected. Please prioritize immediate safety actions.")
+            st.markdown("Detected risk indicators:")
+            for flag in risk_flags:
+                st.markdown(f"- {str(flag).replace('_', ' ').title()}")
+        else:
+            st.success("No immediate safety danger detected from the current query.")
+
+        st.markdown("Recommended safe actions:")
+        if safe_next_steps:
+            for step in safe_next_steps:
+                st.markdown(f"- {step}")
+        else:
+            st.markdown("- Follow the legal steps in the flowchart and seek legal aid support.")
+
+        if disclaimer:
+            st.info(disclaimer)
 
     with tabs[4]:
         table = result.get("passage_table", [])
