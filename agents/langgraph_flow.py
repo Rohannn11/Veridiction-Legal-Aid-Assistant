@@ -329,9 +329,14 @@ class StructuredAdvisor:
         )
 
         summary = self._tts_summary(
+            query=query,
             claim_type=claim_type,
+            urgency=urgency,
             severity_level=severity_level,
             immediate_actions=immediate_actions,
+            legal_actions=legal_actions,
+            process_steps=process_steps,
+            mandatory_documents=documents,
             courts=courts,
         )
 
@@ -411,13 +416,42 @@ class StructuredAdvisor:
             )
         return steps
 
-    def _tts_summary(self, claim_type: str, severity_level: str, immediate_actions: list[str], courts: list[str]) -> str:
-        action = immediate_actions[0] if immediate_actions else "Document the incident and seek legal help promptly."
-        forum = courts[0] if courts else "the appropriate legal authority"
+    def _tts_summary(
+        self,
+        query: str,
+        claim_type: str,
+        urgency: str,
+        severity_level: str,
+        immediate_actions: list[str],
+        legal_actions: list[str],
+        process_steps: list[str],
+        mandatory_documents: list[str],
+        courts: list[str],
+    ) -> str:
+        del query, urgency, severity_level
+
+        next_steps = (immediate_actions + legal_actions)[:3]
+        steps_text = "; ".join(next_steps) if next_steps else (
+            "Collect evidence, prepare a dated timeline, and seek legal aid support"
+        )
+
+        docs_text = ", ".join(mandatory_documents[:4]) if mandatory_documents else "identity proof and incident-related records"
+
+        if process_steps:
+            process_text = " then ".join(process_steps[:2])
+        elif courts:
+            process_text = f"Approach {courts[0]} and submit a written complaint with acknowledgement"
+        else:
+            process_text = "Submit a written complaint to the appropriate authority and track acknowledgement"
+
+        emergency_text = "Call 112 immediately if there is physical danger, and use legal aid helplines for urgent support"
+
         return (
-            f"This appears to be a {claim_type.replace('_', ' ')} matter with {severity_level} severity. "
-            f"First, {action} Then approach {forum}. "
-            "Please use emergency or legal aid helplines if immediate help is needed."
+            f"For your {claim_type.replace('_', ' ')} case, here is what to do now. "
+            f"Next steps: {steps_text}. "
+            f"Keep these documents ready: {docs_text}. "
+            f"Process to follow: {process_text}. "
+            f"Emergency support: {emergency_text}."
         )
 
 

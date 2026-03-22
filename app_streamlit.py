@@ -17,7 +17,7 @@ import urllib.request
 from dataclasses import dataclass
 from html import escape
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
 
@@ -137,6 +137,69 @@ def _section_to_text(title: str, lines: List[str]) -> str:
     for item in lines:
         out.append(f"- {item}")
     return "\n".join(out)
+
+
+def _emit_progress(callback: Optional[Callable[[int, str], None]], pct: int, message: str) -> None:
+    if callback is None:
+        return
+    callback(max(0, min(100, int(pct))), message)
+
+
+def _build_dynamic_tts_summary(output: Dict[str, Any], transcript: str) -> str:
+    structured = output.get("structured_response", {}) or {}
+    steps = structured.get("possible_steps", {}) or {}
+    docs = structured.get("required_documentation", {}) or {}
+    filing = structured.get("courts_and_filing_process", {}) or {}
+    helplines = structured.get("helplines_india", []) or []
+    safety = output.get("safety", {}) or {}
+
+    immediate_actions = [str(x).strip() for x in steps.get("immediate_actions", []) if str(x).strip()]
+    legal_actions = [str(x).strip() for x in steps.get("legal_actions", []) if str(x).strip()]
+    doc_items = (
+        [str(x).strip() for x in docs.get("mandatory", []) if str(x).strip()]
+        + [str(x).strip() for x in docs.get("supporting", []) if str(x).strip()]
+    )
+    process_items = [str(x).strip() for x in filing.get("application_process", []) if str(x).strip()]
+    forum_items = [str(x).strip() for x in filing.get("courts_forum", []) if str(x).strip()]
+    safety_steps = [str(x).strip() for x in safety.get("safe_next_steps", []) if str(x).strip()]
+
+    next_steps_items = (immediate_actions + legal_actions)[:3]
+    next_steps_text = "; ".join(next_steps_items) if next_steps_items else (
+        "Collect evidence, prepare a dated timeline, and approach legal aid"
+    )
+
+    docs_text = ", ".join(doc_items[:4]) if doc_items else "identity proof and all incident-related records"
+
+    if process_items:
+        process_text = " then ".join(process_items[:2])
+    elif forum_items:
+        process_text = f"Approach {forum_items[0]} and submit a written complaint with your documents"
+    else:
+        process_text = "Submit a written complaint to the appropriate authority and track acknowledgement"
+
+    emergency_text = ""
+    emergency_lines: List[str] = []
+    if safety_steps:
+        emergency_lines.append(safety_steps[0])
+    if helplines:
+        for helpline in helplines[:2]:
+            name = str((helpline or {}).get("name", "")).strip()
+            number = str((helpline or {}).get("number", "")).strip()
+            if name and number:
+                emergency_lines.append(f"{name}: {number}")
+    if emergency_lines:
+        emergency_text = "Emergency support: " + " | ".join(emergency_lines[:2])
+    else:
+        emergency_text = "Emergency support: call 112 if there is immediate danger"
+
+    claim = str(output.get("claim_type", "legal issue")).replace("_", " ")
+    return (
+        f"For your {claim} case, here is what to do now. "
+        f"Next steps: {next_steps_text}. "
+        f"Keep these documents ready: {docs_text}. "
+        f"Process to follow: {process_text}. "
+        f"{emergency_text}."
+    )
 
 
 def _extract_structured_sections(structured: Dict[str, Any]) -> Tuple[str, str, str, str, str, str, str, str]:
@@ -271,15 +334,19 @@ def run_pipeline(
     enable_tts: bool,
     tts_engine: str,
     tts_fallback_engine: str,
+    progress_callback: Optional[Callable[[int, str], None]] = None,
 ) -> Dict[str, Any]:
     start = time.perf_counter()
     transcript = ""
     audio_meta: Dict[str, Any] = {}
 
+    _emit_progress(progress_callback, 5, "Validating inputs")
+
     has_audio = bool(audio_file)
     use_audio = _normalize_mode(input_mode, query_text, has_audio)
 
     if use_audio:
+        _emit_progress(progress_callback, 15, "Capturing and transcribing voice input")
         if not audio_file:
             raise ValueError("Audio mode selected but no audio provided.")
         suffix = os.path.splitext(audio_name or "upload.wav")[1] or ".wav"
@@ -304,11 +371,13 @@ def run_pipeline(
         if not transcript:
             raise ValueError("Transcription is empty. Try clearer speech and lower background noise.")
     else:
+        _emit_progress(progress_callback, 15, "Preparing text query")
         transcript = (query_text or "").strip()
 
     if not transcript:
         raise ValueError("Provide either text query or audio input.")
 
+    _emit_progress(progress_callback, 40, "Running retrieval and legal reasoning")
     flow = get_flow(top_k=top_k, provider=advisor_provider)
     output = flow.run(transcript)
     output["input_mode"] = "audio" if use_audio else "text"
@@ -316,8 +385,17 @@ def run_pipeline(
     if audio_meta:
         output["audio_metadata"] = audio_meta
 
+    # Guarantee scenario-specific TTS summary every run, even if provider/fallback is generic.
+    dynamic_tts_summary = _build_dynamic_tts_summary(output=output, transcript=transcript)
+    output["tts_summary"] = dynamic_tts_summary
+    structured_response = output.get("structured_response", {}) or {}
+    if structured_response:
+        structured_response["tts_summary"] = dynamic_tts_summary
+        output["structured_response"] = structured_response
+
     tts_path: Optional[str] = None
     if enable_tts:
+        _emit_progress(progress_callback, 80, "Generating speech output")
         tts = get_tts(tts_engine, tts_fallback_engine)
         tts_spoken_text = str(output.get("tts_summary", "")).strip() or str(output.get("final_text", ""))
         tts_result = tts.speak_to_file(
@@ -332,6 +410,8 @@ def run_pipeline(
             "size_bytes": tts_result["size_bytes"],
             "spoken_text": tts_spoken_text,
         }
+
+    _emit_progress(progress_callback, 92, "Formatting final response")
 
     elapsed_ms = (time.perf_counter() - start) * 1000
     passages = output.get("retrieved_passages", []) or []
@@ -356,6 +436,8 @@ def run_pipeline(
         f"Claim={output.get('claim_type', 'other')} | "
         f"Latency={elapsed_ms:.1f} ms"
     )
+
+    _emit_progress(progress_callback, 100, "Completed")
 
     return {
         "transcript": transcript,
@@ -500,7 +582,14 @@ def main() -> None:
         height=140,
         placeholder="Example: My employer has not paid my salary for 3 months.",
     )
-    audio_upload = st.file_uploader("Voice Input (upload .wav/.mp3)", type=["wav", "mp3", "m4a", "flac"])
+
+    st.markdown("#### Voice Input")
+    if hasattr(st, "audio_input"):
+        st.caption("Record directly from your microphone for real-time voice queries.")
+        audio_upload = st.audio_input("Tap to record voice")
+    else:
+        st.warning("This Streamlit version does not support direct microphone input. Upgrade Streamlit for real-time voice capture.")
+        audio_upload = st.file_uploader("Voice Input (fallback upload)", type=["wav", "mp3", "m4a", "flac"])
 
     example = st.selectbox(
         "Quick Examples",
@@ -517,23 +606,31 @@ def main() -> None:
 
     if st.button("Run End-to-End", type="primary"):
         try:
-            with st.spinner("Running pipeline..."):
-                audio_bytes = audio_upload.read() if audio_upload else None
-                audio_name = audio_upload.name if audio_upload else ""
-                result = run_pipeline(
-                    input_mode=controls["input_mode"],
-                    query_text=query,
-                    audio_file=audio_bytes,
-                    audio_name=audio_name,
-                    top_k=controls["top_k"],
-                    advisor_provider=controls["advisor_provider"],
-                    stt_model_name=controls["stt_model_name"],
-                    stt_model_dir=controls["stt_model_dir"],
-                    stt_local_files_only=controls["stt_local_only"],
-                    enable_tts=controls["enable_tts"],
-                    tts_engine=controls["tts_engine"],
-                    tts_fallback_engine=controls["tts_fallback"],
-                )
+            progress_slot = st.empty()
+            progress = progress_slot.progress(0, text="Starting...")
+
+            def _progress_update(pct: int, message: str) -> None:
+                progress.progress(pct, text=f"{pct}% - {message}")
+
+            audio_bytes = audio_upload.read() if audio_upload else None
+            audio_name = getattr(audio_upload, "name", "") if audio_upload else ""
+            result = run_pipeline(
+                input_mode=controls["input_mode"],
+                query_text=query,
+                audio_file=audio_bytes,
+                audio_name=audio_name,
+                top_k=controls["top_k"],
+                advisor_provider=controls["advisor_provider"],
+                stt_model_name=controls["stt_model_name"],
+                stt_model_dir=controls["stt_model_dir"],
+                stt_local_files_only=controls["stt_local_only"],
+                enable_tts=controls["enable_tts"],
+                tts_engine=controls["tts_engine"],
+                tts_fallback_engine=controls["tts_fallback"],
+                progress_callback=_progress_update,
+            )
+
+            progress.progress(100, text="100% - Completed")
             _render_status_panel(result)
             _render_tabs(result)
         except Exception as exc:
