@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -96,6 +97,10 @@ class RetrieverConfig:
     tfidf_enabled: bool = True   # Use TF-IDF weighting
     procedural_streaming: bool = True  # Stream procedural datasets to reduce local disk usage
     procedural_max_documents: int = 3500  # Limit memory usage for procedural corpus
+    max_rewrites_procedural: int = 2
+    max_rewrites_substantive: int = 2
+    procedural_fallback_threshold: float = 0.84
+    procedural_fallback_top_k: int = 2
 
 
 class LegalRetriever:
@@ -208,6 +213,8 @@ class LegalRetriever:
         if not user_query or not user_query.strip():
             raise ValueError("Query cannot be empty.")
 
+        retrieval_start = time.perf_counter()
+
         similarity_top_k = top_k if top_k is not None else self.config.top_k
         procedural_intent = self._is_procedural_intent(user_query)
         rewritten_queries = self._rewrite_queries(user_query, procedural_intent=procedural_intent)
@@ -231,12 +238,27 @@ class LegalRetriever:
                 with_bias["rewrite_rank"] = idx
                 judgment_results.append(with_bias)
 
-            for item in self._query_procedural_index(user_query=rewritten, top_k=procedural_k):
-                with_bias = dict(item)
-                with_bias["score"] = min(1.0, float(item.get("score", 0.0)) + query_bias)
-                with_bias["rewrite_query"] = rewritten
-                with_bias["rewrite_rank"] = idx
-                procedural_results.append(with_bias)
+            if procedural_intent:
+                for item in self._query_procedural_index(user_query=rewritten, top_k=procedural_k):
+                    with_bias = dict(item)
+                    with_bias["score"] = min(1.0, float(item.get("score", 0.0)) + query_bias)
+                    with_bias["rewrite_query"] = rewritten
+                    with_bias["rewrite_rank"] = idx
+                    procedural_results.append(with_bias)
+
+        procedural_fallback_used = False
+        if not procedural_intent:
+            best_judgment_score = max((float(i.get("score", 0.0)) for i in judgment_results), default=0.0)
+            should_probe_procedural = not judgment_results or best_judgment_score < self.config.procedural_fallback_threshold
+            if should_probe_procedural:
+                procedural_fallback_used = True
+                fallback_query = rewritten_queries[0] if rewritten_queries else user_query
+                fallback_top_k = max(1, min(similarity_top_k, self.config.procedural_fallback_top_k))
+                for item in self._query_procedural_index(user_query=fallback_query, top_k=fallback_top_k):
+                    with_bias = dict(item)
+                    with_bias["rewrite_query"] = fallback_query
+                    with_bias["rewrite_rank"] = 0
+                    procedural_results.append(with_bias)
 
         merged = self._merge_dual_results(
             query=user_query,
@@ -246,6 +268,14 @@ class LegalRetriever:
             procedural_intent=procedural_intent,
             rewritten_queries=rewritten_queries,
         )
+
+        retrieval_elapsed_ms = (time.perf_counter() - retrieval_start) * 1000
+        for item in merged:
+            metadata = dict(item.get("metadata", {}) or {})
+            metadata["retrieval_elapsed_ms"] = round(retrieval_elapsed_ms, 2)
+            metadata["procedural_fallback_used"] = procedural_fallback_used
+            item["metadata"] = metadata
+
         return merged
 
     def _is_procedural_intent(self, query: str) -> bool:
@@ -279,7 +309,8 @@ class LegalRetriever:
                 continue
             seen.add(key)
             unique.append(candidate)
-        return unique[:3]
+        max_rewrites = self.config.max_rewrites_procedural if procedural_intent else self.config.max_rewrites_substantive
+        return unique[:max(1, max_rewrites)]
 
     def _query_judgment_index(self, user_query: str, top_k: int) -> list[dict[str, Any]]:
         if self._judgment_index is None:
@@ -323,6 +354,12 @@ class LegalRetriever:
         keywords = self._extract_keywords_advanced(user_query)
         phrases = self._extract_phrases(user_query)
         expanded = self._expand_with_synonyms(keywords)
+        keyword_patterns = [re.compile(rf"\b{re.escape(keyword)}\b") for keyword in keywords]
+        synonym_terms: set[str] = set()
+        for synonyms in expanded.values():
+            for synonym in synonyms[1:]:
+                synonym_terms.add(synonym)
+        synonym_patterns = [re.compile(rf"\b{re.escape(synonym)}\b") for synonym in synonym_terms]
 
         scored: list[dict[str, Any]] = []
         for row in corpus:
@@ -336,14 +373,13 @@ class LegalRetriever:
                 if phrase in lowered:
                     score += self.config.phrase_boost * 1.1
 
-            for keyword in keywords:
-                if re.search(rf"\b{re.escape(keyword)}\b", lowered):
+            for pattern in keyword_patterns:
+                if pattern.search(lowered):
                     score += self.config.keyword_boost
 
-            for keyword, synonyms in expanded.items():
-                for synonym in synonyms[1:]:
-                    if re.search(rf"\b{re.escape(synonym)}\b", lowered):
-                        score += self.config.synonym_boost
+            for pattern in synonym_patterns:
+                if pattern.search(lowered):
+                    score += self.config.synonym_boost
 
             if score <= 0:
                 continue

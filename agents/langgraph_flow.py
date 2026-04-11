@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -140,6 +141,7 @@ class VeridictionState(TypedDict, total=False):
     advisor_output: dict[str, Any]
     structured_output: dict[str, Any]
     safety_output: dict[str, Any]
+    node_latencies_ms: dict[str, float]
     final_response: dict[str, Any]
     error: str
 
@@ -164,6 +166,8 @@ class GrokClient:
         mapping: dict[str, Any],
         state_name: str,
         helplines: list[dict[str, Any]],
+        max_output_tokens: int | None = None,
+        low_context_mode: bool = False,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError("Grok client is not enabled")
@@ -183,6 +187,7 @@ class GrokClient:
             "output_requirements": {
                 "language": "English",
                 "json_only": True,
+                "answer_mode": "low_context" if low_context_mode else "grounded",
                 "sections": [
                     "case_scenario",
                     "possible_steps",
@@ -205,7 +210,8 @@ class GrokClient:
                     "role": "system",
                     "content": (
                         "You are an Indian legal triage assistant for Maharashtra. Return STRICT JSON only. "
-                        "Use retrieved evidence and mapping. Keep it practical and safety-aware."
+                        "Use retrieved evidence and mapping. Keep it practical and safety-aware. "
+                        "If evidence is sparse, avoid legal certainty and ask concise follow-up details."
                     ),
                 },
                 {
@@ -214,6 +220,8 @@ class GrokClient:
                 },
             ],
         }
+        if max_output_tokens is not None:
+            body["max_tokens"] = int(max_output_tokens)
 
         req = urllib.request.Request(
             url=f"{self.base_url.rstrip('/')}/chat/completions",
@@ -256,6 +264,8 @@ class StructuredAdvisor:
     def generate(self, query: str, claim: dict[str, Any], passages: list[dict[str, Any]]) -> StructuredLegalOutput:
         claim_type = claim.get("claim_type", "other")
         mapping = self.knowledge.claim_mapping(claim_type)
+        top_score = max((float(p.get("score", 0.0)) for p in passages), default=0.0)
+        low_grounding = not passages or top_score < 0.84
 
         if self._can_use_grok():
             try:
@@ -266,12 +276,19 @@ class StructuredAdvisor:
                     mapping=mapping,
                     state_name=self.knowledge.state,
                     helplines=self.knowledge.national_helplines,
+                    max_output_tokens=420 if low_grounding else None,
+                    low_context_mode=low_grounding,
                 )
                 return StructuredLegalOutput.model_validate(raw)
             except Exception as exc:
                 LOGGER.warning("Grok structured generation failed, using deterministic fallback: %s", exc)
 
-        return self._deterministic_response(query=query, claim=claim, passages=passages, mapping=mapping)
+        response = self._deterministic_response(query=query, claim=claim, passages=passages, mapping=mapping)
+        if low_grounding:
+            response.case_scenario.missing_details.append(
+                "Retrieved evidence was limited. Please share more specific facts/documents for higher-confidence guidance."
+            )
+        return response
 
     def _can_use_grok(self) -> bool:
         if self.provider == "fallback":
@@ -480,9 +497,14 @@ class VeridictionGraph:
         return builder.compile()
 
     def retriever_node(self, state: VeridictionState) -> VeridictionState:
+        node_start = time.perf_counter()
         query = state.get("user_query", "")
+        classify_start = time.perf_counter()
         claim = self.classifier.classify(query)
+        classify_ms = (time.perf_counter() - classify_start) * 1000
+        retrieve_start = time.perf_counter()
         passages = self.retriever.query(query, top_k=self.top_k)
+        retrieve_ms = (time.perf_counter() - retrieve_start) * 1000
         retrieval_route = "judgment_priority"
         query_variants: list[str] = []
         if passages:
@@ -492,21 +514,36 @@ class VeridictionGraph:
             if variants_raw:
                 query_variants = [v.strip() for v in variants_raw.split(";") if v.strip()]
 
+        timings = dict(state.get("node_latencies_ms", {}) or {})
+        timings.update(
+            {
+                "classifier_ms": round(classify_ms, 2),
+                "retrieval_ms": round(retrieve_ms, 2),
+                "retriever_node_ms": round((time.perf_counter() - node_start) * 1000, 2),
+            }
+        )
+
         return {
             "claim": claim,
             "retrieved_passages": passages,
             "retrieval_route": retrieval_route,
             "retrieval_query_variants": query_variants,
+            "node_latencies_ms": timings,
         }
 
     def advisor_node(self, state: VeridictionState) -> VeridictionState:
+        node_start = time.perf_counter()
         query = state.get("user_query", "")
         claim = state.get("claim", {})
         passages = state.get("retrieved_passages", [])
         retrieval_route = str(state.get("retrieval_route", "judgment_priority"))
         query_variants = list(state.get("retrieval_query_variants", []) or [])
+        top_score = max((float(p.get("score", 0.0)) for p in passages), default=0.0)
+        grounding_status = "grounded" if top_score >= 0.84 else "low_grounding"
 
+        advisor_start = time.perf_counter()
         structured = self.structured_advisor.generate(query=query, claim=claim, passages=passages)
+        advisor_ms = (time.perf_counter() - advisor_start) * 1000
         advisor_output = self._legacy_advisor_output(structured, passages)
         structured_output = structured.model_dump()
         structured_output["missing_facts_followups"] = self._missing_facts_followups(query=query, claim=claim)
@@ -514,19 +551,34 @@ class VeridictionGraph:
         structured_output["retrieval_context"] = {
             "route": retrieval_route,
             "query_variants": query_variants,
+            "top_score": round(top_score, 4),
+            "grounding_status": grounding_status,
         }
+
+        timings = dict(state.get("node_latencies_ms", {}) or {})
+        timings.update(
+            {
+                "advisor_generation_ms": round(advisor_ms, 2),
+                "advisor_node_ms": round((time.perf_counter() - node_start) * 1000, 2),
+            }
+        )
 
         return {
             "structured_output": structured_output,
             "advisor_output": advisor_output,
+            "node_latencies_ms": timings,
         }
 
     def safety_node(self, state: VeridictionState) -> VeridictionState:
+        node_start = time.perf_counter()
         query = state.get("user_query", "").lower()
         claim = state.get("claim", {})
         advisor_output = state.get("advisor_output", {})
         structured = dict(state.get("structured_output", {}) or {})
         risk_flags = self._risk_flags(query=query, claim=claim)
+        retrieval_context = structured.get("retrieval_context", {}) or {}
+        if retrieval_context.get("grounding_status") == "low_grounding":
+            risk_flags.append("limited_grounding")
 
         safe_steps: list[str] = []
         if "immediate_danger" in risk_flags:
@@ -568,10 +620,17 @@ class VeridictionGraph:
             "section_citations": structured.get("section_citations", {}),
             "safety": safety_output.model_dump(),
             "tts_summary": structured.get("tts_summary", ""),
+            "node_latencies_ms": state.get("node_latencies_ms", {}),
             "final_text": self._compose_final_text(structured=structured, safety=safety_output),
         }
+
+        timings = dict(state.get("node_latencies_ms", {}) or {})
+        timings["safety_node_ms"] = round((time.perf_counter() - node_start) * 1000, 2)
+        final_response["node_latencies_ms"] = timings
+
         return {
             "safety_output": safety_output.model_dump(),
+            "node_latencies_ms": timings,
             "final_response": final_response,
         }
 
@@ -755,9 +814,15 @@ class VeridictionGraph:
         return buckets
 
     def run(self, user_query: str) -> dict[str, Any]:
+        run_start = time.perf_counter()
         initial_state: VeridictionState = {"user_query": user_query}
         result = self.graph.invoke(initial_state)
-        return result.get("final_response", {})
+        final = result.get("final_response", {})
+        total_ms = (time.perf_counter() - run_start) * 1000
+        node_latencies = dict(final.get("node_latencies_ms", {}) or {})
+        node_latencies["total_pipeline_ms"] = round(total_ms, 2)
+        final["node_latencies_ms"] = node_latencies
+        return final
 
 
 def _build_cli() -> argparse.ArgumentParser:

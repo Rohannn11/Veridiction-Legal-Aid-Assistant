@@ -45,6 +45,7 @@ class ClaimResult:
     urgency: str
     confidence: float
     rationale_short: str
+    secondary_claim_types: list[str]
     intent_labels: list[str]
     intent_scores: dict[str, float]
 
@@ -54,6 +55,7 @@ class ClaimResult:
             "urgency": self.urgency,
             "confidence": round(self.confidence, 4),
             "rationale_short": self.rationale_short,
+            "secondary_claim_types": self.secondary_claim_types,
             "intent_labels": self.intent_labels,
             "intent_scores": {k: round(v, 4) for k, v in self.intent_scores.items()},
         }
@@ -172,6 +174,53 @@ class ClaimClassifier:
         "non payment",
     )
 
+    PAID_IN_FULL_PATTERNS: tuple[str, ...] = (
+        "already paid",
+        "paid on time",
+        "salary paid",
+        "wages paid",
+        "received salary",
+        "got my salary",
+        "payment received",
+    )
+
+    NON_PAYMENT_PATTERNS: tuple[str, ...] = (
+        "not paid",
+        "did not pay",
+        "unpaid",
+        "payment pending",
+        "salary pending",
+        "salary due",
+        "wage due",
+        "withheld",
+        "outstanding dues",
+        "pending wages",
+    )
+
+    CHILD_CONTEXT_MARKERS: tuple[str, ...] = (
+        "child",
+        "minor",
+        "underage",
+        "under-age",
+        "kid",
+        "teen",
+        "below 18",
+        "under 18",
+    )
+
+    LABOR_CONTEXT_MARKERS: tuple[str, ...] = (
+        "work",
+        "factory",
+        "employer",
+        "salary",
+        "wage",
+        "wages",
+        "labor",
+        "labour",
+        "shift",
+        "job",
+    )
+
     INTENT_PATTERNS: dict[str, tuple[str, ...]] = {
         "procedural": (
             "how",
@@ -259,6 +308,9 @@ class ClaimClassifier:
             if best_score < self.config.min_confidence:
                 best_label = self.config.fallback_claim_type
 
+            best_label = self._apply_priority_overrides(text=text, best_label=best_label)
+            secondary_claims = self._secondary_claim_types(combined_scores, best_label)
+
             urgency = self._detect_urgency(text, best_label)
             rationale = self._build_rationale(best_label, keyword_scores, embedding_scores)
             intent_scores = self._intent_scores(text=text, claim_type=best_label, urgency=urgency)
@@ -269,6 +321,7 @@ class ClaimClassifier:
                 urgency=urgency,
                 confidence=float(best_score),
                 rationale_short=rationale,
+                secondary_claim_types=secondary_claims,
                 intent_labels=intent_labels,
                 intent_scores=intent_scores,
             )
@@ -287,6 +340,9 @@ class ClaimClassifier:
                     hits += 1
             if patterns:
                 scores[label] = hits / len(patterns)
+
+        if any(pattern in lowered for pattern in self.PAID_IN_FULL_PATTERNS):
+            scores["unpaid_wages"] = min(scores.get("unpaid_wages", 0.0), 0.05)
 
         if all(value == 0.0 for value in scores.values()):
             scores["other"] = 0.1
@@ -322,7 +378,13 @@ class ClaimClassifier:
 
     def _detect_urgency(self, text: str, claim_type: str) -> str:
         lowered = text.lower()
+        if self._looks_like_paid_resolved(text):
+            return "low"
+
         if any(token in lowered for token in self.HIGH_URGENCY_PATTERNS):
+            return "high"
+
+        if self._looks_like_child_labor(text):
             return "high"
 
         if claim_type in {"domestic_violence", "police_harassment"}:
@@ -381,6 +443,39 @@ class ClaimClassifier:
         if not labels and ranked:
             labels = [ranked[0][0]]
         return labels[:3]
+
+    def _looks_like_child_labor(self, text: str) -> bool:
+        lowered = text.lower()
+        has_child_context = any(token in lowered for token in self.CHILD_CONTEXT_MARKERS)
+        has_labor_context = any(token in lowered for token in self.LABOR_CONTEXT_MARKERS)
+        has_minor_age_signal = bool(re.search(r"\bunder\s*18\b|\bbelow\s*18\b|\bminor\b|\b(1[0-7]|[1-9])\s*(years|yrs)\b", lowered))
+        return has_child_context and has_labor_context and (has_minor_age_signal or "child" in lowered)
+
+    def _apply_priority_overrides(self, text: str, best_label: str) -> str:
+        if best_label == "unpaid_wages" and self._looks_like_paid_resolved(text):
+            return "other"
+        if self._looks_like_child_labor(text):
+            return "other"
+        return best_label
+
+    def _looks_like_paid_resolved(self, text: str) -> bool:
+        lowered = text.lower()
+        has_paid_markers = any(token in lowered for token in self.PAID_IN_FULL_PATTERNS)
+        has_non_payment_markers = any(token in lowered for token in self.NON_PAYMENT_PATTERNS)
+        return has_paid_markers and not has_non_payment_markers
+
+    def _secondary_claim_types(self, combined_scores: dict[str, float], best_label: str) -> list[str]:
+        ranked = sorted(combined_scores.items(), key=lambda item: item[1], reverse=True)
+        secondary: list[str] = []
+        for label, score in ranked:
+            if label == best_label:
+                continue
+            primary_score = float(combined_scores.get(best_label, 0.0))
+            if score >= 0.45 and (primary_score - score) <= 0.08:
+                secondary.append(label)
+            if len(secondary) >= 2:
+                break
+        return secondary
 
 
 def _build_cli() -> argparse.ArgumentParser:
