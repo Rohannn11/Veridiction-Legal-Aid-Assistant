@@ -1,4 +1,4 @@
-# Veridiction: Indian Legal Aid Assistant (GenAI Prototype)
+# Veridiction: Indian Legal Aid Assistant 
 
 Veridiction is an end-to-end legal aid assistant prototype designed for laypersons in India, with Maharashtra-focused procedural grounding.
 
