@@ -1,57 +1,80 @@
-# Indian-Law-Assistant-GenAI
+# Veridiction: Indian Legal Aid Assistant (GenAI Prototype)
 
-End-to-end legal assistance prototype for Indian law scenarios with:
-1. Hybrid legal retrieval (RAG)
-2. Claim classification and urgency detection
-3. LangGraph orchestration for advisor + safety output
-4. Real-time speech-to-text from microphone (Step 4)
-5. Text-to-speech response generation (Step 5)
-6. Gradio system interface for full workflow testing (Step 6)
+Veridiction is an end-to-end legal aid assistant prototype designed for laypersons in India, with Maharashtra-focused procedural grounding.
 
-## Current Implementation Status
+It accepts text or voice input, detects likely legal issue type and urgency, retrieves relevant legal material, generates structured guidance, adds safety escalation signals, and can speak the output back to the user.
 
-Completed:
-1. Step 1: Advanced RAG retriever with TF-IDF, phrase boosts, synonym expansion, calibrated scoring
-2. Step 2: Hybrid claim classifier with keyword + embedding scoring
-3. Step 3: LangGraph flow (Retriever -> Advisor -> Safety) with deterministic fallback advisor
-4. Step 4: Audio transcription using faster-whisper distil-large-v3 with live microphone mode
-5. Step 5: TTS output utility with edge-tts primary and pyttsx3 offline fallback
-6. Step 6: Gradio UI for end-to-end testing with text/voice input and TTS playback
+## Objective
 
-## Methodology
+The primary objective is practical legal triage for non-experts:
 
-### Step 1 Methodology: Retrieval
+1. Help users describe legal problems in plain language.
+2. Convert vague narratives into structured legal next steps.
+3. Surface emergency-aware guidance when risk indicators are present.
+4. Keep outputs explainable with retrieved passages and deterministic fallbacks.
+5. Make the workflow accessible through voice and UI interfaces.
 
-File: [rag/retriever.py](rag/retriever.py)
+This project is for research and prototyping, not legal representation.
 
-Approach:
-1. Build local vector index from legal datasets using LlamaIndex
-2. Retrieve dense candidates via sentence embeddings
-3. Re-rank with lexical relevance:
-	1. Phrase match boost
-	2. TF-IDF weighted keyword boost
-	3. Domain synonym boost
-4. Calibrate final scores into consistent high-confidence range
+## End-to-End Capabilities
 
-Key techniques:
-1. Aggressive candidate expansion (fetch 5x then rerank)
-2. Corpus-level IDF calculation and caching
-3. Legal domain synonym map
-4. Score calibration to stable 0.80-0.95 style range for top results
+1. Hybrid retrieval (dense + lexical reranking + query rewrites) over Indian legal datasets.
+2. Claim classification with urgency and intent labels.
+3. LangGraph orchestration: Retriever -> Advisor -> Safety.
+4. Speech-to-text from file, fixed mic recording, or live mic capture.
+5. Text-to-speech response generation with online + offline fallback.
+6. Interactive Gradio and Streamlit apps for full workflow testing.
 
-### Step 2 Methodology: Classification
+## Architecture
 
-File: [nlp/classifier.py](nlp/classifier.py)
+```mermaid
+flowchart LR
+    A[User Input: Text or Audio] --> B[Step 4 STT if audio]
+    B --> C[Step 2 Claim Classifier]
+    C --> D[Step 1 Hybrid Retriever]
+    D --> E[Step 3 Structured Advisor]
+    E --> F[Step 3 Safety Layer]
+    F --> G[Structured Response + Final Text]
+    G --> H[Step 5 TTS Optional]
+    G --> I[Step 6 UI JSON and Tables]
+```
 
-Approach:
-1. Rule-based keyword scoring for deterministic signal
-2. Embedding similarity to claim prototypes for semantic signal
+## Methodology by Step
+
+### Step 1: Retrieval
+
+Implementation: [rag/retriever.py](rag/retriever.py)
+
+Core strategy:
+
+1. Build local vector index with LlamaIndex and Hugging Face embeddings.
+2. Route between judgment-heavy retrieval and procedural retrieval.
+3. Expand query variants using intent-aware rewrites.
+4. Re-rank with phrase boosts, TF-IDF-like keyword weighting, and legal synonym boosts.
+5. Merge and calibrate top-k results with metadata for traceability.
+
+Notable behavior:
+
+1. Pulls broad candidate sets, then reranks aggressively.
+2. Uses procedural fallback when substantive retrieval confidence is low.
+3. Preserves source metadata and retrieval route in output.
+
+### Step 2: Classification and Urgency
+
+Implementation: [nlp/classifier.py](nlp/classifier.py)
+
+Core strategy:
+
+1. Rule-based keyword scoring for deterministic signal.
+2. Semantic similarity scoring using sentence-transformers embeddings.
 3. Weighted fusion:
-	1. Embedding weight: 0.65
-	2. Keyword weight: 0.35
-4. Urgency detection via lexical patterns + claim-type priors
+   1. Embedding weight: 0.65
+   2. Keyword weight: 0.35
+4. Urgency estimation from lexical risk patterns and claim context.
+5. Intent scoring for procedural, evidence, forum, timeline, and relief cues.
 
 Supported claim types:
+
 1. unpaid_wages
 2. domestic_violence
 3. property_dispute
@@ -61,213 +84,270 @@ Supported claim types:
 7. consumer_fraud
 8. other
 
-### Step 3 Methodology: Orchestration and Safety
+### Step 3: Orchestration, Structured Advice, and Safety
 
-File: [agents/langgraph_flow.py](agents/langgraph_flow.py)
+Implementation: [agents/langgraph_flow.py](agents/langgraph_flow.py)
 
-Pipeline graph:
-1. Retriever node: classification + passage retrieval
-2. Advisor node: LLM structured response or deterministic fallback
-3. Safety node: risk flags + mandatory legal disclaimer
+Graph pipeline:
 
-Advisor strategy:
-1. Primary: local quantized Llama-based structured advisor
-2. Fallback: deterministic template-based advisor with actionable steps
+1. Retriever node: classification + top-k retrieval.
+2. Advisor node: structured legal response generation.
+3. Safety node: risk flags, escalation suggestions, mandatory disclaimer.
 
-Safety strategy:
-1. Detect high-risk contexts (violence/threat/urgent patterns)
-2. Add escalation guidance
-3. Always append mandatory disclaimer
+Advisor generation policy:
 
-### Step 4 Methodology: Speech-to-Text
+1. Primary: Grok chat-completions client when API credentials are available.
+2. Fallback: deterministic structured template based on classification + retrieved passages + knowledge mappings.
+3. Grounding-aware behavior: low-context mode when retrieval confidence is weak.
 
-File: [audio/transcriber.py](audio/transcriber.py)
+Safety policy:
 
-Input modes:
-1. Audio file transcription
-2. Fixed-duration microphone recording
-3. Live microphone capture with stop by:
-	1. Enter key
-	2. Silence threshold duration
-	3. Max duration timeout
+1. Detect immediate danger and other high-risk contexts.
+2. Upgrade severity metadata where needed.
+3. Always include mandatory legal disclaimer.
 
-Reliability features:
-1. Model cache directory support
-2. Local-files-only mode for offline reuse after first download
-3. Download warmup mode
-4. Timeout and explicit first-run guidance logs
+### Step 4: Speech-to-Text
 
-### Step 5 Methodology: Text-to-Speech
+Implementation: [audio/transcriber.py](audio/transcriber.py)
 
-File: [tts/speak.py](tts/speak.py)
+Core strategy:
 
-Synthesis strategy:
-1. Primary engine: edge-tts (high quality free cloud voice)
-2. Fallback engine: pyttsx3 (offline local TTS)
+1. Uses faster-whisper with distil-large-v3 defaults.
+2. Supports file transcription, fixed-duration recording, and live mic mode.
+3. Live mode supports stop by Enter key, silence threshold, or max duration.
+4. Supports local model caching and local-files-only operation after warmup.
+
+### Step 5: Text-to-Speech
+
+Implementation: [tts/speak.py](tts/speak.py)
+
+Core strategy:
+
+1. Primary engine: edge-tts (high-quality network synthesis).
+2. Fallback engine: pyttsx3 (offline local synthesis).
 3. Safe text normalization before synthesis:
-	1. Remove markdown/code fences
-	2. Remove control characters
-	3. Collapse whitespace
-	4. Clamp max text length
-4. Ensure disclaimer inclusion by default
+   1. remove markdown and code fences
+   2. remove control characters
+   3. collapse whitespace
+   4. clamp length
+4. Returns structured audio artifact metadata.
 
-Artifact output:
-1. audio_path
-2. audio_bytes
-3. mime_type
-4. size_bytes
+### Step 6: User Interfaces
 
-### Step 6 Methodology: System Interface
+Implementations:
 
-File: [app_gradio.py](app_gradio.py)
+1. [app_gradio.py](app_gradio.py)
+2. [app_streamlit.py](app_streamlit.py)
 
-UI flow:
-1. Accept text or microphone/upload audio
-2. Run STT if audio is selected
-3. Run end-to-end legal graph
-4. Optionally generate TTS
-5. Display transcript, classification, passages, final response, raw JSON, and playable audio
+UI behavior:
 
-## Models Used
+1. Accept text or audio input.
+2. Run STT (when needed).
+3. Execute end-to-end legal graph.
+4. Optionally synthesize TTS output.
+5. Show structured sections, safety JSON, retrieval table, and final text.
 
-### Embedding Models
-1. sentence-transformers/all-MiniLM-L6-v2
-	1. Used in retriever embeddings
-	2. Used in classifier semantic similarity
+## Models and External Services
 
-### Advisor Model (Primary)
-1. meta-llama/Llama-3.2-3B-Instruct
-	1. Loaded in 4-bit quantized mode (bitsandbytes)
-	2. Falls back to deterministic advisor if unavailable
+1. Embeddings: sentence-transformers/all-MiniLM-L6-v2
+2. STT: faster-whisper distil-large-v3 (HF alias: Systran/faster-distil-whisper-large-v3)
+3. Advisor LLM: Grok API (optional, enabled via env vars)
+4. Deterministic advisor fallback: always available without API keys
+5. TTS engines: edge-tts (primary), pyttsx3 (fallback)
 
-### STT Model
-1. faster-whisper distil-large-v3
-	1. FasterWhisper ID: distil-large-v3
-	2. HF repo alias used by library: Systran/faster-distil-whisper-large-v3
+## Datasets and Knowledge
 
-### TTS Voices/Engines
-1. edge-tts voice default: en-IN-NeerjaNeural
-2. pyttsx3 fallback for offline local generation
+Retrieval datasets (configured in Step 1):
 
-## Datasets Used
-
-Retriever dataset sources (Hugging Face):
 1. vihaannnn/Indian-Supreme-Court-Judgements-Chunked
 2. Subimal10/indian-legal-data-cleaned
+3. viber1/indian-law-dataset
+4. ShreyasP123/Legal-Dataset-for-india
+5. nisaar/Lawyer_GPT_India
 
-Retriever implementation details:
-1. Deduplicates normalized passages
-2. Extracts text from common fields (text/chunk/passage/content/clean_text/judgment_text/body)
-3. Preserves legal metadata for traceability where available
+Knowledge mapping:
+
+1. [data/legal_knowledge/maharashtra_legal_knowledge.json](data/legal_knowledge/maharashtra_legal_knowledge.json)
+2. Loaded by [legal/knowledge_base.py](legal/knowledge_base.py)
 
 ## Tech Stack
 
-Core language/runtime:
-1. Python 3.11 (conda environment)
-
-ML and NLP:
-1. torch
-2. sentence-transformers
-3. transformers
-4. bitsandbytes (for 4-bit advisor load)
-
-Retrieval and data:
-1. llama-index-core
-2. llama-index-embeddings-huggingface
-3. datasets (Hugging Face Datasets)
-
-Audio:
-1. faster-whisper
-2. sounddevice
-3. numpy
-
-TTS:
-1. edge-tts
-2. pyttsx3
-
-Workflow and API structure:
-1. langgraph
-2. pydantic
-
-UI:
-1. gradio
+1. Python 3.11
+2. PyTorch
+3. sentence-transformers
+4. transformers
+5. llama-index-core
+6. llama-index-embeddings-huggingface
+7. datasets
+8. langgraph
+9. pydantic
+10. faster-whisper
+11. sounddevice
+12. numpy
+13. edge-tts
+14. pyttsx3
+15. gradio
+16. streamlit
 
 ## Project Structure
 
 Core modules:
+
 1. [rag/retriever.py](rag/retriever.py)
 2. [nlp/classifier.py](nlp/classifier.py)
 3. [agents/langgraph_flow.py](agents/langgraph_flow.py)
 4. [audio/transcriber.py](audio/transcriber.py)
 5. [tts/speak.py](tts/speak.py)
-6. [app_gradio.py](app_gradio.py)
+6. [legal/knowledge_base.py](legal/knowledge_base.py)
 
-Validation and reports:
-1. [validate_retriever_advanced.py](validate_retriever_advanced.py)
-2. [validate_step4_audio.py](validate_step4_audio.py)
+Apps:
+
+1. [app_gradio.py](app_gradio.py)
+2. [app_streamlit.py](app_streamlit.py)
+
+Validation:
+
+1. [rag/validate_retriever_advanced.py](rag/validate_retriever_advanced.py)
+2. [audio/validate_step4_audio.py](audio/validate_step4_audio.py)
 3. [VALIDATION_QUERIES.py](VALIDATION_QUERIES.py)
-4. [VALIDATION.md](VALIDATION.md)
+4. [Documentation/VALIDATION.md](Documentation/VALIDATION.md)
 
-## Setup and Run
+## Environment and Configuration Principles
 
-Environment recommendation:
-1. Use your conda env: veridiction
-2. Use Python executable:
-	C:/Users/rohan/miniconda3/envs/veridiction/python.exe
+This project is intentionally modular. You can run it in any Python 3.11 environment (venv, conda, poetry, uv) as long as dependencies are installed and the same interpreter is used consistently for all commands.
 
-Install dependencies (if missing):
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe -m pip install torch sentence-transformers transformers bitsandbytes
-2. C:/Users/rohan/miniconda3/envs/veridiction/python.exe -m pip install llama-index-core llama-index-embeddings-huggingface datasets
-3. C:/Users/rohan/miniconda3/envs/veridiction/python.exe -m pip install faster-whisper sounddevice numpy
-4. C:/Users/rohan/miniconda3/envs/veridiction/python.exe -m pip install edge-tts pyttsx3 gradio langgraph pydantic
+Recommended environment strategy:
 
-### Step 4 warmup and live transcription
+1. Create an isolated Python environment for reproducibility.
+2. Keep ML/audio/UI dependencies installed in the same environment.
+3. Reuse cached model artifacts under the data folder to avoid repeated downloads.
+4. Treat cloud services (Grok, edge-tts) as optional accelerators, not hard dependencies.
+5. Ensure deterministic fallback paths stay available for offline or API-failure scenarios.
 
-Warmup model download once:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe audio/transcriber.py --download-only --model-name distil-large-v3 --model-dir data/models/faster-whisper
+Suggested dependency groups:
 
-Live mic transcription using local cache:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe audio/transcriber.py --live-mic --local-files-only --model-dir data/models/faster-whisper --record-out data/audio_live.wav --max-seconds 30 --silence-seconds 2.0 --language en
+1. Core NLP and retrieval: torch, sentence-transformers, transformers, llama-index-core, llama-index-embeddings-huggingface, datasets.
+2. Orchestration and schema: langgraph, pydantic.
+3. Audio: faster-whisper, sounddevice, numpy.
+4. TTS and UI: edge-tts, pyttsx3, gradio, streamlit.
 
-### End-to-end pipeline (text/audio + optional TTS)
+Portable dependency installation:
 
-Text mode:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe agents/langgraph_flow.py --query "My employer has not paid my salary for 3 months" --top-k 5
+```bash
+python -m pip install torch sentence-transformers transformers
+python -m pip install llama-index-core llama-index-embeddings-huggingface datasets
+python -m pip install langgraph pydantic
+python -m pip install faster-whisper sounddevice numpy
+python -m pip install edge-tts pyttsx3 gradio streamlit
+```
 
-Live mic mode + local STT cache:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe agents/langgraph_flow.py --live-mic --audio-model-dir data/models/faster-whisper --audio-local-files-only --record-out data/audio_live.wav --audio-max-seconds 30 --audio-silence-seconds 2.0 --audio-language en --top-k 5
+Optional Grok configuration:
 
-Live mic + TTS response output:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe agents/langgraph_flow.py --live-mic --audio-model-dir data/models/faster-whisper --audio-local-files-only --record-out data/audio_live.wav --audio-max-seconds 30 --audio-silence-seconds 2.0 --audio-language en --top-k 5 --enable-tts --tts-output data/tts/final_response.mp3 --tts-engine edge_tts --tts-fallback-engine pyttsx3
+Create a .env file in repository root if you want LLM-backed structured advisor responses:
 
-### Step 5 standalone TTS
+```env
+GROK_API_KEY=your_api_key_here
+GROK_BASE_URL=https://api.x.ai/v1
+GROK_MODEL=grok-2-latest
+```
 
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe tts/speak.py --text "Your complaint appears to be unpaid wages. Please gather salary slips and file a written complaint." --output data/tts/sample_response.mp3 --engine edge_tts --fallback-engine pyttsx3
+If not set, the system automatically uses deterministic fallback advisor logic.
 
-### Step 6 UI launch
+## Run Guide
 
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe app_gradio.py
-2. Open: http://127.0.0.1:7860
+### A) Step 4 warmup (download STT model once)
+
+```bash
+python audio/transcriber.py --download-only --model-name distil-large-v3 --model-dir data/models/faster-whisper
+```
+
+### B) Step 4 live mic transcription
+
+```bash
+python audio/transcriber.py --live-mic --local-files-only --model-dir data/models/faster-whisper --record-out data/audio_live.wav --max-seconds 30 --silence-seconds 2.0 --language en
+```
+
+### C) End-to-end flow (text)
+
+```bash
+python agents/langgraph_flow.py --query "My employer has not paid my salary for 3 months" --top-k 5 --advisor-provider auto
+```
+
+### D) End-to-end flow (live mic + STT local cache)
+
+```bash
+python agents/langgraph_flow.py --live-mic --audio-model-dir data/models/faster-whisper --audio-local-files-only --record-out data/audio_live.wav --audio-max-seconds 30 --audio-silence-seconds 2.0 --audio-language en --top-k 5 --advisor-provider auto
+```
+
+### E) End-to-end flow (live mic + TTS output)
+
+```bash
+python agents/langgraph_flow.py --live-mic --audio-model-dir data/models/faster-whisper --audio-local-files-only --record-out data/audio_live.wav --audio-max-seconds 30 --audio-silence-seconds 2.0 --audio-language en --top-k 5 --advisor-provider auto --enable-tts --tts-output data/tts/final_response.mp3 --tts-engine edge_tts --tts-fallback-engine pyttsx3
+```
+
+### F) Standalone Step 5 TTS
+
+```bash
+python tts/speak.py --text "Your complaint appears to be unpaid wages. Please gather salary slips and file a written complaint." --output data/tts/sample_response.mp3 --engine edge_tts --fallback-engine pyttsx3
+```
+
+### G) Launch Gradio UI
+
+```bash
+python app_gradio.py
+```
+
+Gradio opens on the first available localhost port, typically starting at http://127.0.0.1:7860.
+
+### H) Launch Streamlit UI
+
+```bash
+python -m streamlit run app_streamlit.py
+```
 
 ## Validation
 
-Retriever quality validation:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe validate_retriever_advanced.py --force-rebuild
+### Retriever quality validation
 
-Audio validation:
-1. C:/Users/rohan/miniconda3/envs/veridiction/python.exe validate_step4_audio.py --audio-file data/sample.wav --report-out data/step4_validation_report.json
+```bash
+python rag/validate_retriever_advanced.py --force-rebuild
+```
 
-Manual test set:
-1. Use [VALIDATION_QUERIES.py](VALIDATION_QUERIES.py)
+### Step 4 audio + pipeline validation
 
-## Deployment Note for Two-End Sync
+```bash
+python audio/validate_step4_audio.py --audio-file data/sample.wav --local-files-only --report-out data/step4_validation_report.json
+```
 
-For production sync between two user ends:
-1. Keep a single backend service as source of truth
-2. Clients send requests to backend API (not local scripts)
-3. Persist transcript/response/audio artifacts in shared DB and object storage
-4. Return stable session IDs and artifact URLs
-5. Use websocket/polling for cross-client state sync
+### Manual scenario testing
+
+Use [VALIDATION_QUERIES.py](VALIDATION_QUERIES.py) to run coverage across claim types, edge cases, and performance scenarios.
+
+## Safety, Scope, and Limitations
+
+1. Outputs are triage guidance, not legal advice.
+2. System currently focuses on English-language interactions.
+3. Procedural mapping is Maharashtra-oriented by default.
+4. Retrieval confidence can vary with sparse or ambiguous user input.
+5. For emergencies, users should prioritize immediate official support services.
+
+## Suggested Production Path
+
+For multi-user deployment and sync across clients:
+
+1. Move orchestration to a single backend API.
+2. Store transcripts, structured outputs, and audio artifacts in shared persistence.
+3. Use stable session IDs and artifact URLs.
+4. Add auth, audit logs, and role-based access.
+5. Add websocket or polling-based cross-client synchronization.
+
+## Troubleshooting
+
+1. If STT model load fails on first run, rerun warmup and allow full download completion.
+2. If Grok output is unavailable, verify .env credentials; fallback mode should still work.
+3. If mic capture is empty, check OS microphone permissions and input device selection.
+4. If TTS edge engine fails, pyttsx3 fallback should generate local WAV output.
+5. If module imports fail, verify that python and pip both point to the same active environment.
 
 ## Disclaimer
 
